@@ -29,10 +29,41 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
   // Security middleware
   app.use(helmet());
-  app.use(cors({
-    origin: config.security.allowedOrigins,
-    credentials: true
-  }));
+  // app.use(cors({
+  //   origin: config.security.allowedOrigins,
+  //   credentials: true,
+
+  //   // Access from checkin suite
+  //   preflightContinue: false,
+  //   optionsSuccessStatus: 200
+  // }));
+
+  // middleware to handle private network requests
+  app.use((req: Request, res: Response, next: NextFunction): void => {
+    const origin = req.headers.origin;
+    const allowedOrigins = config.security.allowedOrigins;
+
+    if (allowedOrigins.includes(origin || '')) {
+      res.header('Access-Control-Allow-Origin', origin);
+    }
+
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Credentials', 'true');
+
+    // This is the key header for private network requests
+    if (req.headers['access-control-request-private-network']) {
+      res.header('Access-Control-Allow-Private-Network', 'true');
+    }
+
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+      res.sendStatus(200);
+      return;
+    }
+
+    next();
+  });
 
   // Rate limiting
   const limiter = rateLimit({

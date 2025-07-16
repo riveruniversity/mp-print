@@ -31,6 +31,8 @@ export interface PrintJob {
 
 export interface PrinterStatus {
   name: string;
+  port: string;
+  driver: string;
   status: PrinterStatusType;
   jobsInQueue: number;
   lastJobTime?: number;

@@ -2,6 +2,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
+import puppeteer, { Browser, Page } from 'puppeteer';
 import { PrinterStatus, PrinterStatusType, PrintMetadata, WindowsPrinter } from '../types';
 import { config } from '../config';
 import logger from '../utils/logger';
@@ -11,14 +12,34 @@ const execAsync = promisify(exec);
 export class PrinterService {
   private printers: Map<string, PrinterStatus> = new Map();
   private healthCheckInterval?: ReturnType<typeof setInterval>;
-  private edgePath?: string;
+  private browser?: Browser;
   private wkhtmltopdfPath?: string;
 
   public async initialize(): Promise<void> {
-    await this.findEdgePath();
     await this.findWkhtmltopdf();
+    await this.initializePuppeteer();
     await this.discoverPrinters();
     this.startHealthCheck();
+  }
+
+  private async initializePuppeteer(): Promise<void> {
+    try {
+      this.browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor',
+        ]
+      });
+      logger.info('Puppeteer browser initialized successfully');
+    } catch (error) {
+      logger.error('Failed to initialize Puppeteer:', error);
+      throw new Error('Puppeteer initialization failed');
+    }
   }
 
   private async findWkhtmltopdf(): Promise<void> {
@@ -34,11 +55,11 @@ export class PrinterService {
           // Test if it's in PATH
           await execAsync('where wkhtmltopdf.exe');
           this.wkhtmltopdfPath = path;
-          logger.info('Found wkhtmltopdf in system PATH');
+          logger.info('Found wkhtmltopdf in system PATH - available as fallback');
           return;
         } else if (existsSync(path)) {
           this.wkhtmltopdfPath = path;
-          logger.info(`Found wkhtmltopdf at: ${path}`);
+          logger.info(`Found wkhtmltopdf at: ${path} - available as fallback`);
           return;
         }
       } catch (error) {
@@ -46,40 +67,7 @@ export class PrinterService {
       }
     }
 
-    logger.warn('wkhtmltopdf not found - will use Edge as fallback');
-  }
-
-  private async findEdgePath(): Promise<void> {
-    const possiblePaths = [
-      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-      process.env.LOCALAPPDATA + '\\Microsoft\\Edge\\Application\\msedge.exe'
-    ];
-
-    for (const path of possiblePaths) {
-      if (existsSync(path)) {
-        this.edgePath = path;
-        logger.info(`Found Microsoft Edge at: ${path}`);
-        return;
-      }
-    }
-
-    // Try to find Edge via PowerShell
-    try {
-      const command = `powershell -Command "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe' | Select-Object '(default)' | ForEach-Object { $_.'(default)' }"`;
-      const { stdout } = await execAsync(command);
-      if (stdout.trim()) {
-        this.edgePath = stdout.trim();
-        logger.info(`Found Microsoft Edge via registry: ${this.edgePath}`);
-        return;
-      }
-    } catch (error) {
-      logger.warn('Could not find Edge via registry');
-    }
-
-    // Fallback to system PATH
-    this.edgePath = 'msedge.exe';
-    logger.warn('Using msedge.exe from system PATH - ensure Microsoft Edge is in PATH');
+    logger.warn('wkhtmltopdf not found - Puppeteer will be the only available method');
   }
 
   private async discoverPrinters(): Promise<void> {
@@ -99,12 +87,15 @@ export class PrinterService {
       for (const printer of printerArray) {
         this.printers.set(printer.Name, {
           name: printer.Name,
+          port: printer.PortName,
+          driver: printer.DriverName,
           status: this.mapPrinterStatus(printer.PrinterStatus),
           jobsInQueue: 0,
           errorCount: 0
         });
       }
 
+      console.log('🖨️  printers', printerArray.map(p => p.Name));
       logger.info(`Discovered ${this.printers.size} printers`);
     } catch (error: any) {
       logger.error('Failed to discover printers:', error);
@@ -175,7 +166,6 @@ export class PrinterService {
   }
 
   public async printLabel(printerName: string, htmlContent: string, metadata: Partial<PrintMetadata>): Promise<void> {
-
     const copies = metadata.copies || 1;
     const printer: PrinterStatus | undefined = this.printers.get(printerName);
     if (!printer || printer.status !== 'online') {
@@ -189,54 +179,30 @@ export class PrinterService {
       // Create enhanced HTML with print-specific CSS
       const enhancedHtml = this.enhanceHtmlForPrinting(decodedHtml);
 
-      // Create temporary HTML file
-      const timestamp = Date.now();
-      const randomId = Math.random().toString(36).substr(2, 9);
-      const tempFile: string = `temp_${timestamp}_${randomId}.html`;
-      const tmpDir = join(process.cwd(), 'tmp');
-      if (!existsSync(tmpDir)) {
-        require('fs').mkdirSync(tmpDir, { recursive: true });
-      }
-      const fullTempPath = join(tmpDir, tempFile);
-
-      writeFileSync(fullTempPath, enhancedHtml, 'utf8');
-
       const totalStartTime = Date.now();
 
-      // Try lightweight method first, fallback to Edge
-      if (this.wkhtmltopdfPath) {
+      // Try Puppeteer first (primary method), fallback to wkhtmltopdf
+      if (this.browser) {
         try {
-          logger.info(`=== LIGHTWEIGHT WKHTMLTOPDF METHOD ===`);
-          const lightweightStartTime = Date.now();
-
-          for (let i: number = 0; i < copies; i++) {
-            await this.printWithWkhtmltopdf(fullTempPath, printerName, i + 1, copies, metadata);
-          }
-
-          const lightweightTime = Date.now() - lightweightStartTime;
-          logger.info(`✅ WKHTMLTOPDF: ${copies} copies printed in ${lightweightTime}ms (avg: ${Math.round(lightweightTime / copies)}ms per copy)`);
+          await this.printWithPuppeteer(enhancedHtml, printerName, copies, metadata);
         } catch (error) {
-          logger.warn(`❌ WKHTMLTOPDF FAILED: ${error}, falling back to Edge`);
-          await this.fallbackToEdge(fullTempPath, printerName, copies);
+          logger.warn(`❌ PUPPETEER FAILED: ${error}, falling back to wkhtmltopdf`);
+          if (this.wkhtmltopdfPath) {
+            await this.printWithWkhtmltopdf(enhancedHtml, printerName, copies, metadata);
+          } else {
+            throw new Error('Both Puppeteer and wkhtmltopdf are unavailable');
+          }
         }
+      } else if (this.wkhtmltopdfPath) {
+        // Use wkhtmltopdf as fallback if Puppeteer is not available
+        logger.info(`=== WKHTMLTOPDF FALLBACK METHOD ===`);
+        await this.printWithWkhtmltopdf(enhancedHtml, printerName, copies, metadata);
       } else {
-        // Use Edge method
-        await this.fallbackToEdge(fullTempPath, printerName, copies);
+        throw new Error('Neither Puppeteer nor wkhtmltopdf is available');
       }
 
       const totalTime = Date.now() - totalStartTime;
       logger.info(`📊 TOTAL PRINT JOB: ${copies} copies completed in ${totalTime}ms`);
-
-      // Clean up temporary file
-      setTimeout(() => {
-        try {
-          if (existsSync(fullTempPath)) {
-            unlinkSync(fullTempPath);
-          }
-        } catch (cleanupError) {
-          logger.warn(`Failed to cleanup temp file ${tempFile}:`, cleanupError);
-        }
-      }, 2000);
 
       logger.info(`Successfully printed ${copies} copies to ${printerName}`);
     } catch (error: any) {
@@ -245,12 +211,133 @@ export class PrinterService {
     }
   }
 
-  private async printWithWkhtmltopdf(htmlFilePath: string, printerName: string, copyNumber: number, totalCopies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+
+  private async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+    if (!this.browser) {
+      throw new Error('Puppeteer browser not initialized');
+    }
+
+    logger.info(`=== PUPPETEER PRIMARY METHOD ===`);
+    const puppeteerStartTime = Date.now();
+
+    try {
+      const page: Page = await this.browser.newPage();
+
+      // Set page content
+      await page.setContent(html, { waitUntil: 'networkidle0' });
+
+      // Configure PDF options
+      const pdfOptions = {
+        // format: 'A4' as const,
+        printBackground: true,
+        width: '10in',
+        height: '1in',
+        margin: {
+          top: '0mm',
+          right: '0mm',
+          bottom: '0mm',
+          left: '0mm'
+        }
+      };
+
+      // Override format if custom dimensions are needed
+      // if (metadata?.paperSize) {
+      //   pdfOptions.format = metadata.paperSize as any;
+      // }
+
+      // Generate PDF for each copy
+      for (let i = 0; i < copies; i++) {
+        const copyStartTime = Date.now();
+
+        // Generate PDF buffer
+        const pdfBuffer = await page.pdf(pdfOptions);
+
+        // Create temporary PDF file
+        const timestamp = Date.now();
+        const randomId = Math.random().toString(36).substr(2, 9);
+        const pdfFileName = `temp_${timestamp}_${randomId}_copy${i + 1}.pdf`;
+        const tmpDir = join(process.cwd(), 'tmp');
+        if (!existsSync(tmpDir)) {
+          require('fs').mkdirSync(tmpDir, { recursive: true });
+        }
+        const pdfFilePath = join(tmpDir, pdfFileName);
+
+        // Write PDF to file
+        writeFileSync(pdfFilePath, pdfBuffer);
+
+        // Print PDF using PDFtoPrinter.exe
+        const binDir = join(process.cwd(), 'bin');
+        const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
+        const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${printerName}"`;
+
+        await execAsync(printCommand, { timeout: 10000 });
+
+        // Clean up PDF file
+        setTimeout(() => {
+          try {
+            if (existsSync(pdfFilePath)) {
+              unlinkSync(pdfFilePath);
+            }
+          } catch (cleanupError) {
+            logger.warn(`Failed to cleanup PDF file:`, cleanupError);
+          }
+        }, 2000);
+
+        const copyDuration = Date.now() - copyStartTime;
+        logger.debug(`⚡ Puppeteer copy ${i + 1}/${copies}: ${copyDuration}ms`);
+
+        // Small delay between copies
+        if (i < copies - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+
+      await page.close();
+
+      const puppeteerTime = Date.now() - puppeteerStartTime;
+      logger.info(`✅ PUPPETEER PRIMARY: ${copies} copies printed in ${puppeteerTime}ms (avg: ${Math.round(puppeteerTime / copies)}ms per copy)`);
+
+    } catch (error: any) {
+      logger.error(`❌ Puppeteer primary method failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private async printWithWkhtmltopdf(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+    const startTime = Date.now();
+
+    logger.info(`=== WKHTMLTOPDF FALLBACK METHOD ===`);
+
+    try {
+      for (let i: number = 0; i < copies; i++) {
+        await this.printSingleCopyWithWkhtmltopdf(html, printerName, i + 1, copies, metadata);
+      }
+
+      const wkhtmltopdfTime = Date.now() - startTime;
+      logger.info(`✅ WKHTMLTOPDF FALLBACK: ${copies} copies printed in ${wkhtmltopdfTime}ms (avg: ${Math.round(wkhtmltopdfTime / copies)}ms per copy)`);
+
+    } catch (error: any) {
+      logger.error(`❌ wkhtmltopdf fallback failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private async printSingleCopyWithWkhtmltopdf(html: string, printerName: string, copyNumber: number, totalCopies: number, metadata: Partial<PrintMetadata>): Promise<void> {
     const startTime = Date.now();
 
     try {
-      // Create PDF from HTML using wkhtmltopdf with auto-sizing
+      // Create temporary HTML file
+      const timestamp = Date.now();
+      const randomId = Math.random().toString(36).substr(2, 9);
+      const tempFile: string = `temp_${timestamp}_${randomId}.html`;
+      const tmpDir = join(process.cwd(), 'tmp');
+      if (!existsSync(tmpDir)) {
+        require('fs').mkdirSync(tmpDir, { recursive: true });
+      }
+      const htmlFilePath = join(tmpDir, tempFile);
       const pdfFile = htmlFilePath.replace('.html', '.pdf');
+
+      writeFileSync(htmlFilePath, html, 'utf8');
 
       // Build wkhtmltopdf command
       const args = [
@@ -258,8 +345,6 @@ export class PrinterService {
         '--margin-bottom 0',
         '--margin-left 0',
         '--margin-right 0',
-        // '--disable-smart-shrinking',
-        // '--print-media-type',
         '--enable-local-file-access',
         '--page-width 1in',
         '--page-height 10in'
@@ -281,14 +366,17 @@ export class PrinterService {
 
       await execAsync(printCommand, { timeout: 5000 });
 
-      // Clean up PDF file
+      // Clean up files
       setTimeout(() => {
         try {
+          if (existsSync(htmlFilePath)) {
+            unlinkSync(htmlFilePath);
+          }
           if (existsSync(pdfFile)) {
             unlinkSync(pdfFile);
           }
         } catch (cleanupError) {
-          logger.warn(`Failed to cleanup PDF file:`, cleanupError);
+          logger.warn(`Failed to cleanup temp files:`, cleanupError);
         }
       }, 2000);
 
@@ -307,23 +395,6 @@ export class PrinterService {
     }
   }
 
-  private async fallbackToEdge(htmlFilePath: string, printerName: string, copies: number): Promise<void> {
-    if (!this.edgePath) {
-      throw new Error('Neither wkhtmltopdf nor Edge is available');
-    }
-
-    logger.info(`=== EDGE FALLBACK METHOD ===`);
-    const edgeStartTime = Date.now();
-
-    const fileUrl = `file:///${htmlFilePath.replace(/\\/g, '/')}`;
-
-    for (let i: number = 0; i < copies; i++) {
-      await this.printWithEdge(fileUrl, printerName, i + 1, copies);
-    }
-
-    const edgeTime = Date.now() - edgeStartTime;
-    logger.info(`✅ EDGE FALLBACK: ${copies} copies printed in ${edgeTime}ms (avg: ${Math.round(edgeTime / copies)}ms per copy)`);
-  }
 
   private enhanceHtmlForPrinting(html: string): string {
     // Add print-specific CSS if not already present
@@ -352,47 +423,85 @@ export class PrinterService {
     return html;
   }
 
-  private async printWithEdge(fileUrl: string, printerName: string, copyNumber: number, totalCopies: number): Promise<void> {
-    const timeout = config.printing.ieTimeout || 10000;
-
-    const escapedEdgePath = this.edgePath!.replace(/\\/g, '\\\\');
-    const timeoutSeconds = Math.floor(timeout / 1000);
-
-    const powershellCommand = `
-      $process = Start-Process -FilePath '${escapedEdgePath}' -ArgumentList '--headless', '--disable-gpu', '--disable-web-security', '--no-sandbox', '--print-to-printer=${printerName}', '${fileUrl}' -PassThru -WindowStyle Hidden;
-      try {
-        $process | Wait-Process -Timeout ${timeoutSeconds};
-        Write-Output 'COMPLETED'
-      } catch {
-        $process | Stop-Process -Force -ErrorAction SilentlyContinue;
-        Write-Output 'TIMEOUT'
-      }
-    `.replace(/\s+/g, ' ').trim();
-
+  public async resetZebraMediaValues(printerName: string): Promise<boolean> {
     try {
-      logger.debug(`Printing copy ${copyNumber}/${totalCopies} to ${printerName}`);
+      logger.info(`Resetting media values for Zebra printer: ${printerName}`);
 
-      const { stdout, stderr } = await execAsync(`powershell -Command "${powershellCommand}"`, {
-        timeout: timeout + 2000,
-        windowsHide: true
-      });
-
-      if (stdout.includes('TIMEOUT')) {
-        logger.warn(`Edge process timeout for copy ${copyNumber}, but print job may have been submitted`);
-      } else if (stdout.includes('COMPLETED')) {
-        logger.debug(`Edge process completed for copy ${copyNumber}`);
+      // Check if printer exists and is online
+      const printer: PrinterStatus | undefined = this.printers.get(printerName);
+      if (!printer || printer.status !== 'online') {
+        throw new Error(`Printer ${printerName} is not available`);
       }
 
-      if (copyNumber < totalCopies) {
-        await new Promise(resolve => setTimeout(resolve, 500));
+      // ZPL commands to reset media values for ZTC ZD620-203dpi
+      const zplCommands = [
+        '~SD20',        // Set darkness to 20
+        '~JSN',         // Disable JSON
+        '^XA',          // Start format
+        '^SZ2',         // Set ZPL mode to ZPL II
+        '^PW203',       // Set print width to 203 dots (1 inch at 203 DPI)
+        '^LL2030',      // Set label length to 2030 dots (10 inches at 203 DPI)
+        '^POI',         // Print orientation (N)ormal | (I)nverted
+        '^PMN',         // Print method normal
+        '^MNM',         // Media tracking method - non-continuous (gap/notch)
+        '^LS0',         // Label shift 0
+        '^MTT',         // Media type thermal transfer
+        '^MMT,N',       // Print mode thermal transfer, normal
+        '^MPE',         // Mode print and cut
+        '^XZ',          // End format
+        '^XA^JUS^XZ'    // Reset all settings and save
+      ].join('\n');
+
+      // Create temporary ZPL file
+      const timestamp = Date.now();
+      const randomId = Math.random().toString(36).substr(2, 9);
+      const tempFile: string = `zebra_reset_${timestamp}_${randomId}.zpl`;
+      const tmpDir = join(process.cwd(), 'tmp');
+
+      if (!existsSync(tmpDir)) {
+        require('fs').mkdirSync(tmpDir, { recursive: true });
+      }
+
+      const fullTempPath = join(tmpDir, tempFile);
+      writeFileSync(fullTempPath, zplCommands, 'utf8');
+
+      // Send ZPL commands to printer using Windows copy command
+      const copyCommand = `copy "${fullTempPath}" "${printerName}"`;
+
+      try {
+        const { stdout, stderr } = await execAsync(copyCommand, { timeout: 10000 });
+        logger.info(`✅ ZPL commands sent successfully to ${printerName}`);
+
+        // Clean up temporary file
+        setTimeout(() => {
+          try {
+            if (existsSync(fullTempPath)) {
+              unlinkSync(fullTempPath);
+            }
+          } catch (cleanupError) {
+            logger.warn(`Failed to cleanup ZPL temp file ${tempFile}:`, cleanupError);
+          }
+        }, 2000);
+
+        return true;
+      } catch (error: any) {
+        logger.error(`Failed to send ZPL commands to ${printerName}:`, error);
+
+        // Clean up temporary file on error
+        try {
+          if (existsSync(fullTempPath)) {
+            unlinkSync(fullTempPath);
+          }
+        } catch (cleanupError) {
+          logger.warn(`Failed to cleanup ZPL temp file ${tempFile}:`, cleanupError);
+        }
+
+        return false;
       }
 
     } catch (error: any) {
-      if (error.code === 'TIMEOUT') {
-        logger.warn(`PowerShell timeout for copy ${copyNumber} after ${timeout}ms`);
-      } else {
-        throw new Error(`Print failed for copy ${copyNumber}: ${error.message}`);
-      }
+      logger.error(`Reset media values failed for printer ${printerName}:`, error);
+      return false;
     }
   }
 
@@ -430,6 +539,11 @@ export class PrinterService {
   public destroy(): void {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
+    }
+    if (this.browser) {
+      this.browser.close().catch(error => {
+        logger.error('Error closing Puppeteer browser:', error);
+      });
     }
   }
 }

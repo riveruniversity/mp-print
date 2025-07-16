@@ -60,15 +60,15 @@ export class PrintService {
     const jobs: PrintJob[] = this.queueService.getNextJobs(
       Math.min(availableSlots, config.printing.batchSize)
     );
-    
-    const processingPromises: Promise<void>[] = jobs.map((job: PrintJob): Promise<void> => 
+
+    const processingPromises: Promise<void>[] = jobs.map((job: PrintJob): Promise<void> =>
       this.processJob(job)
     );
     await Promise.allSettled(processingPromises);
   }
 
   private async processJob(job: PrintJob): Promise<void> {
-    const { request }: { request: PrintRequest } = job;
+    const { request }: { request: PrintRequest; } = job;
     const startTime: number = Date.now();
 
     try {
@@ -89,7 +89,7 @@ export class PrintService {
 
       // Complete the job
       this.queueService.completeJob(job.id, true);
-      
+
       // Update metrics
       const processingTime: number = Date.now() - startTime;
       this.updateProcessingTime(processingTime);
@@ -106,11 +106,11 @@ export class PrintService {
   private updateProcessingTime(processingTime: number): void {
     const currentAvg: number = this.metrics.averageProcessingTime;
     const currentCount: number = this.metrics.completedJobs;
-    
+
     if (currentCount === 0) {
       this.metrics.averageProcessingTime = processingTime;
     } else {
-      this.metrics.averageProcessingTime = 
+      this.metrics.averageProcessingTime =
         (currentAvg * (currentCount - 1) + processingTime) / currentCount;
     }
   }
@@ -118,11 +118,11 @@ export class PrintService {
   private updateMetrics(): void {
     const queueStatus: QueueStatus = this.queueService.getQueueStatus();
     this.metrics.queueLength = queueStatus.queued;
-    this.metrics.totalJobs = queueStatus.queued + queueStatus.processing + 
-                           queueStatus.completed + queueStatus.failed;
-    
+    this.metrics.totalJobs = queueStatus.queued + queueStatus.processing +
+      queueStatus.completed + queueStatus.failed;
+
     const printers: PrinterStatus[] = this.printerService.getAllPrinters();
-    this.metrics.activePrinters = printers.filter((p: PrinterStatus): boolean => 
+    this.metrics.activePrinters = printers.filter((p: PrinterStatus): boolean =>
       p.status === 'online'
     ).length;
   }
@@ -142,6 +142,10 @@ export class PrintService {
 
   public getPrinterStatus(): PrinterStatus[] {
     return this.printerService.getAllPrinters();
+  }
+
+  public async resetZebraMediaValues(printerName: string): Promise<boolean> {
+    return await this.printerService.resetZebraMediaValues(printerName);
   }
 
   public destroy(): void {
