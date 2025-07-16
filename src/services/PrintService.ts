@@ -84,7 +84,7 @@ export class PrintService {
       await this.printerService.printLabel(
         request.printerName,
         request.htmlContent,
-        request.metadata.copies
+        request.metadata
       );
 
       // Complete the job

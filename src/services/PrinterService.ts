@@ -2,7 +2,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
-import { PrinterStatus, PrinterStatusType, WindowsPrinter } from '../types';
+import { PrinterStatus, PrinterStatusType, PrintMetadata, WindowsPrinter } from '../types';
 import { config } from '../config';
 import logger from '../utils/logger';
 
@@ -174,7 +174,9 @@ export class PrinterService {
     }
   }
 
-  public async printLabel(printerName: string, htmlContent: string, copies: number = 1): Promise<void> {
+  public async printLabel(printerName: string, htmlContent: string, metadata: Partial<PrintMetadata>): Promise<void> {
+
+    const copies = metadata.copies || 1;
     const printer: PrinterStatus | undefined = this.printers.get(printerName);
     if (!printer || printer.status !== 'online') {
       throw new Error(`Printer ${printerName} is not available`);
@@ -191,8 +193,12 @@ export class PrinterService {
       const timestamp = Date.now();
       const randomId = Math.random().toString(36).substr(2, 9);
       const tempFile: string = `temp_${timestamp}_${randomId}.html`;
-      const fullTempPath = join(process.cwd(), tempFile);
-      
+      const tmpDir = join(process.cwd(), 'tmp');
+      if (!existsSync(tmpDir)) {
+        require('fs').mkdirSync(tmpDir, { recursive: true });
+      }
+      const fullTempPath = join(tmpDir, tempFile);
+
       writeFileSync(fullTempPath, enhancedHtml, 'utf8');
 
       const totalStartTime = Date.now();
@@ -202,13 +208,13 @@ export class PrinterService {
         try {
           logger.info(`=== LIGHTWEIGHT WKHTMLTOPDF METHOD ===`);
           const lightweightStartTime = Date.now();
-          
+
           for (let i: number = 0; i < copies; i++) {
-            await this.printWithWkhtmltopdf(fullTempPath, printerName, i + 1, copies);
+            await this.printWithWkhtmltopdf(fullTempPath, printerName, i + 1, copies, metadata);
           }
-          
+
           const lightweightTime = Date.now() - lightweightStartTime;
-          logger.info(`✅ WKHTMLTOPDF: ${copies} copies printed in ${lightweightTime}ms (avg: ${Math.round(lightweightTime/copies)}ms per copy)`);
+          logger.info(`✅ WKHTMLTOPDF: ${copies} copies printed in ${lightweightTime}ms (avg: ${Math.round(lightweightTime / copies)}ms per copy)`);
         } catch (error) {
           logger.warn(`❌ WKHTMLTOPDF FAILED: ${error}, falling back to Edge`);
           await this.fallbackToEdge(fullTempPath, printerName, copies);
@@ -239,20 +245,40 @@ export class PrinterService {
     }
   }
 
-  private async printWithWkhtmltopdf(htmlFilePath: string, printerName: string, copyNumber: number, totalCopies: number): Promise<void> {
+  private async printWithWkhtmltopdf(htmlFilePath: string, printerName: string, copyNumber: number, totalCopies: number, metadata: Partial<PrintMetadata>): Promise<void> {
     const startTime = Date.now();
 
     try {
-      // Create PDF from HTML using wkhtmltopdf
+      // Create PDF from HTML using wkhtmltopdf with auto-sizing
       const pdfFile = htmlFilePath.replace('.html', '.pdf');
-      
-      const convertCommand = `"${this.wkhtmltopdfPath}" --page-size A4 --margin-top 0 --margin-bottom 0 --margin-left 0 --margin-right 0 --disable-smart-shrinking --print-media-type "${htmlFilePath}" "${pdfFile}"`;
-      
+
+      // Build wkhtmltopdf command
+      const args = [
+        '--margin-top 0',
+        '--margin-bottom 0',
+        '--margin-left 0',
+        '--margin-right 0',
+        // '--disable-smart-shrinking',
+        // '--print-media-type',
+        '--enable-local-file-access',
+        '--page-width 1in',
+        '--page-height 10in'
+      ];
+
+      if (metadata?.orientation) {
+        args.push('--orientation ' + metadata.orientation);
+      }
+
+      args.push(`"${htmlFilePath}"`, `"${pdfFile}"`);
+
+      const convertCommand = `"${this.wkhtmltopdfPath}" ${args.join(' ')}`;
       await execAsync(convertCommand, { timeout: 5000 });
 
       // Print PDF using PDFtoPrinter.exe
-      const printCommand = `PDFtoPrinter.exe "${pdfFile}" "${printerName}"`;
-      
+      const binDir = join(process.cwd(), 'bin');
+      const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
+      const printCommand = `"${pdfToPrinterPath}" "${pdfFile}" "${printerName}"`;
+
       await execAsync(printCommand, { timeout: 5000 });
 
       // Clean up PDF file
@@ -288,15 +314,15 @@ export class PrinterService {
 
     logger.info(`=== EDGE FALLBACK METHOD ===`);
     const edgeStartTime = Date.now();
-    
+
     const fileUrl = `file:///${htmlFilePath.replace(/\\/g, '/')}`;
-    
+
     for (let i: number = 0; i < copies; i++) {
       await this.printWithEdge(fileUrl, printerName, i + 1, copies);
     }
-    
+
     const edgeTime = Date.now() - edgeStartTime;
-    logger.info(`✅ EDGE FALLBACK: ${copies} copies printed in ${edgeTime}ms (avg: ${Math.round(edgeTime/copies)}ms per copy)`);
+    logger.info(`✅ EDGE FALLBACK: ${copies} copies printed in ${edgeTime}ms (avg: ${Math.round(edgeTime / copies)}ms per copy)`);
   }
 
   private enhanceHtmlForPrinting(html: string): string {
@@ -328,10 +354,10 @@ export class PrinterService {
 
   private async printWithEdge(fileUrl: string, printerName: string, copyNumber: number, totalCopies: number): Promise<void> {
     const timeout = config.printing.ieTimeout || 10000;
-    
+
     const escapedEdgePath = this.edgePath!.replace(/\\/g, '\\\\');
     const timeoutSeconds = Math.floor(timeout / 1000);
-    
+
     const powershellCommand = `
       $process = Start-Process -FilePath '${escapedEdgePath}' -ArgumentList '--headless', '--disable-gpu', '--disable-web-security', '--no-sandbox', '--print-to-printer=${printerName}', '${fileUrl}' -PassThru -WindowStyle Hidden;
       try {
@@ -345,7 +371,7 @@ export class PrinterService {
 
     try {
       logger.debug(`Printing copy ${copyNumber}/${totalCopies} to ${printerName}`);
-      
+
       const { stdout, stderr } = await execAsync(`powershell -Command "${powershellCommand}"`, {
         timeout: timeout + 2000,
         windowsHide: true
@@ -393,7 +419,7 @@ export class PrinterService {
       `;
 
       const base64Html = Buffer.from(testHtml).toString('base64');
-      await this.printLabel(printerName, base64Html, 1);
+      await this.printLabel(printerName, base64Html, { copies: 1 });
       return true;
     } catch (error) {
       logger.error(`Test print failed for ${printerName}:`, error);
