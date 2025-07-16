@@ -243,18 +243,19 @@ export class PrinterService {
     const startTime = Date.now();
 
     try {
-      // Create PDF from HTML
+      // Create PDF from HTML using wkhtmltopdf
       const pdfFile = htmlFilePath.replace('.html', '.pdf');
       
       const convertCommand = `"${this.wkhtmltopdfPath}" --page-size A4 --margin-top 0 --margin-bottom 0 --margin-left 0 --margin-right 0 --disable-smart-shrinking --print-media-type "${htmlFilePath}" "${pdfFile}"`;
       
       await execAsync(convertCommand, { timeout: 5000 });
 
-      // Print PDF using Windows print command
-      const printCommand = `powershell -Command "Start-Process -FilePath '${pdfFile}' -Verb Print -WindowStyle Hidden"`;
-      await execAsync(printCommand, { timeout: 3000 });
+      // Print PDF using PDFtoPrinter.exe
+      const printCommand = `PDFtoPrinter.exe "${pdfFile}" "${printerName}"`;
+      
+      await execAsync(printCommand, { timeout: 5000 });
 
-      // Clean up PDF
+      // Clean up PDF file
       setTimeout(() => {
         try {
           if (existsSync(pdfFile)) {
@@ -263,14 +264,14 @@ export class PrinterService {
         } catch (cleanupError) {
           logger.warn(`Failed to cleanup PDF file:`, cleanupError);
         }
-      }, 3000);
+      }, 2000);
 
       const duration = Date.now() - startTime;
       logger.debug(`⚡ wkhtmltopdf copy ${copyNumber}/${totalCopies}: ${duration}ms`);
 
       // Small delay between copies
       if (copyNumber < totalCopies) {
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 300));
       }
 
     } catch (error: any) {
