@@ -5,7 +5,7 @@ dotenv.config();
 
 export const config = {
   server: {
-    port: parseNumber(process.env.PORT, 3000),
+    port: parseNumber(process.env.PORT, 8080),
     host: process.env.HOST || '0.0.0.0',
     workers: parseNumber(process.env.WORKERS, 4),
     maxRequestSize: process.env.MAX_REQUEST_SIZE || '50mb',
