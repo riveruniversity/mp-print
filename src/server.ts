@@ -27,7 +27,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   const app: Application = express();
   let printService: PrintService;
 
-  // Alternative simpler configuration if you trust the entire private network:
+  // trust the entire private network:
   app.set('trust proxy', ['loopback', '10.0.0.0/8']);
 
   // Security middleware
@@ -74,6 +74,24 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     max: config.security.rateLimitMax,
     message: { error: 'Too many requests' }
   });
+
+
+  // Handle client disconnects gracefully
+  app.use((req: Request, res: Response, next: NextFunction): void => {
+    // Handle client disconnects gracefully using modern approach
+    req.on('close', () => {
+      if (req.destroyed) {
+        logger.warn(`Request closed/destroyed by client: ${req.method} ${req.path} - ${req.ip}`);
+      }
+    });
+
+    // Set connection keep-alive
+    res.set('Connection', 'keep-alive');
+
+    next();
+  });
+
+
   app.use('/api/', limiter);
 
   // Body parsing and compression
@@ -103,11 +121,24 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
   // Error handling middleware
   app.use((err: any, req: Request, res: Response, next: NextFunction): void => {
+    if (err.code === 'ECONNABORTED' || err.type === 'request.aborted') {
+      logger.warn(`Client disconnected: ${req.method} ${req.path} - ${req.ip}`, {
+        error: err.message,
+        userAgent: req.get('User-Agent')
+      });
+      // Don't try to send a response if the connection is already closed
+      return;
+    }
+
     logger.error('Unhandled error:', err);
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
+
+    // Only send response if connection is still open
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
   });
 
   // 404 handler
