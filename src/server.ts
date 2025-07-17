@@ -27,6 +27,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   const app: Application = express();
   let printService: PrintService;
 
+  // Alternative simpler configuration if you trust the entire private network:
+  app.set('trust proxy', ['loopback', '10.0.0.0/8']);
+
   // Security middleware
   app.use(helmet());
   // app.use(cors({

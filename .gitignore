@@ -124,3 +124,9 @@ temp_*.html
 # Service installation temp files
 install-service-temp.js
 uninstall-service-temp.js
+
+
+# Lock files (choose one based on your package manager)
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
