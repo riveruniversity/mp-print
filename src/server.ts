@@ -1,3 +1,5 @@
+// src/server.ts - Updated to use singleton properly
+
 import express, { Application, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -7,8 +9,7 @@ import cluster, { type Worker } from 'cluster';
 
 import { config } from './config';
 import logger from './utils/logger';
-import printRoutes from './routes/print';
-import { PrintService } from './services/PrintService';
+import printRoutes, { initializePrintService } from './routes/print';
 import { HealthCheckResponse } from './types';
 
 if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
@@ -25,7 +26,6 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   });
 } else {
   const app: Application = express();
-  let printService: PrintService;
 
   // trust the entire private network:
   app.set('trust proxy', ['loopback', '10.0.0.0/8', '127.0.0.1', '::1']);
@@ -37,16 +37,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     contentSecurityPolicy: false
   }));
 
-  // app.use(cors({
-  //   origin: config.security.allowedOrigins,
-  //   credentials: true,
-
-  //   // Access from checkin suite
-  //   preflightContinue: false,
-  //   optionsSuccessStatus: 200
-  // }));
-
-  // middleware to handle private network requests
+  // CORS middleware
   app.use((req: Request, res: Response, next: NextFunction): void => {
     const origin = req.headers.origin;
     const allowedOrigins = config.security.allowedOrigins;
@@ -59,12 +50,10 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Forwarded-For');
     res.header('Access-Control-Allow-Credentials', 'true');
 
-    // This is the key header for private network requests
     if (req.headers['access-control-request-private-network']) {
       res.header('Access-Control-Allow-Private-Network', 'true');
     }
 
-    // Handle preflight requests
     if (req.method === 'OPTIONS') {
       res.sendStatus(200);
       return;
@@ -73,8 +62,6 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     next();
   });
 
-
-
   // Rate limiting
   const limiter = rateLimit({
     windowMs: config.security.rateLimitWindowMs,
@@ -82,25 +69,19 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     message: { error: 'Too many requests' }
   });
 
-
   // Handle client disconnects gracefully
   app.use((req: Request, res: Response, next: NextFunction): void => {
-    // Handle client disconnects gracefully using modern approach
     req.on('close', () => {
       if (req.destroyed) {
-        logger.warn(`Request closed/destroyed by client: ${req.method} ${req.path} - ${req.ip}`);
+        logger.debug(`Client disconnected: ${req.method} ${req.path} - ${req.ip}`);
       }
     });
 
-    // Set connection keep-alive
     res.set('Connection', 'keep-alive');
-
     next();
   });
 
   app.use('/api/', limiter);
-
-
 
   // Body parsing and compression
   app.use(compression());
@@ -134,13 +115,11 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
         error: err.message,
         userAgent: req.get('User-Agent')
       });
-      // Don't try to send a response if the connection is already closed
       return;
     }
 
     logger.error('Unhandled error:', err);
 
-    // Only send response if connection is still open
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
@@ -161,13 +140,13 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   const server = app.listen(config.server.port, config.server.host, async (): Promise<void> => {
     logger.info(`🗄️  Print server running on ${config.server.host}:${config.server.port}`);
 
-    // Initialize print service
+    // Initialize print service ONCE using singleton
     try {
-      printService = new PrintService();
-      await printService.initialize();
-      logger.info('Print service initialized successfully');
+      logger.info('Initializing print service singleton...');
+      await initializePrintService();
+      logger.info('✅ Print service initialized successfully');
     } catch (error: any) {
-      logger.error('Failed to initialize print service:', error);
+      logger.error('❌ Failed to initialize print service:', error);
       process.exit(1);
     }
   });
@@ -179,9 +158,18 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   const gracefulShutdown = (signal: string): void => {
     logger.info(`${signal} received, shutting down gracefully`);
     server.close((): void => {
-      if (printService) {
-        printService.destroy();
+      // Use singleton instance for cleanup
+      try {
+        const PrintService = require('./services/PrintService').PrintService;
+        const instance = PrintService.getInstance();
+        if (instance) {
+          instance.destroy();
+          logger.info('PrintService singleton destroyed');
+        }
+      } catch (error) {
+        logger.warn('Error during PrintService cleanup:', error);
       }
+
       logger.info('Server shut down complete');
       process.exit(0);
     });
@@ -190,7 +178,6 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   process.on('SIGTERM', (): void => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', (): void => gracefulShutdown('SIGINT'));
 
-  // Handle uncaught exceptions
   process.on('uncaughtException', (error: Error): void => {
     logger.error('Uncaught Exception:', error);
     process.exit(1);

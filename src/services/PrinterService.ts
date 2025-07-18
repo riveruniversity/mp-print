@@ -16,7 +16,7 @@ export class PrinterService {
   private healthCheckInterval?: ReturnType<typeof setInterval>;
   private browser?: Browser;
   private wkhtmltopdfPath?: string;
-  
+
   // Page pool for better performance
   private pagePool: Page[] = [];
   private maxPoolSize: number = 5;
@@ -201,12 +201,29 @@ export class PrinterService {
     }
   }
 
+
+
+
+
+
+  private async initializePagePool(): Promise<void> {
+    logger.info('Page pooling disabled for stability - using fresh pages per job');
+    // Don't initialize page pool - we'll create fresh pages for each job
+    this.pagePool = [];
+    this.maxPoolSize = 0;
+    this.pagePoolSemaphore = 0;
+  }
+
+
+
+  // Ultra-conservative Puppeteer implementation - replace methods in PrinterService.ts
+
+  // 1. Replace initializePuppeteer with ultra-conservative version
   private async initializePuppeteer(): Promise<void> {
     try {
       this.browser = await puppeteer.launch({
         headless: true,
         args: [
-          '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--disable-gpu',
@@ -227,347 +244,295 @@ export class PrinterService {
           '--disable-ipc-flooding-protection',
           // Memory optimizations
           '--memory-pressure-off',
-          '--max_old_space_size=4096',
-          // Performance optimizations
-          '--single-process', // Use single process for better resource management
         ],
-        // Keep browser alive longer
-        timeout: 0,
-        protocolTimeout: 60000,
+        timeout: 30000, // Very generous timeout
+        protocolTimeout: 120000, // 2 minutes protocol timeout
+        defaultViewport: {
+          width: 800,
+          height: 600, // Standard size, not too small
+          deviceScaleFactor: 1
+        }
       });
 
-      // Keep browser alive with a dummy page
-      const keepAlivePage = await this.browser.newPage();
-      await keepAlivePage.goto('data:text/html,<html><body>Keep Alive</body></html>');
-      
-      logger.info('Puppeteer browser initialized successfully with optimizations');
-    } catch (error) {
-      logger.error('Failed to initialize Puppeteer:', error);
-      throw new Error('Puppeteer initialization failed');
+      logger.info('Ultra-conservative Puppeteer browser initialized (minimal args)');
+    } catch (error: any) {
+      logger.error('Failed to initialize ultra-conservative Puppeteer:', error);
+      throw new Error('Ultra-conservative Puppeteer initialization failed');
     }
   }
 
-  private async initializePagePool(): Promise<void> {
-    if (!this.browser) return;
+  // 2. Replace printWithPuppeteer with ultra-conservative version
+  private async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+    if (!this.browser || !this.browser.connected) {
+      throw new Error('Browser not available');
+    }
+
+    logger.info(`=== ULTRA-CONSERVATIVE PUPPETEER ===`);
+    const startTime = Date.now();
+
+    let page: Page | null = null;
 
     try {
-      // Pre-create pages for the pool
-      for (let i = 0; i < this.maxPoolSize; i++) {
-        const page = await this.createOptimizedPage();
-        this.pagePool.push(page);
-      }
-      logger.info(`Initialized page pool with ${this.maxPoolSize} pages`);
-    } catch (error) {
-      logger.error('Failed to initialize page pool:', error);
-    }
-  }
+      // Create page with minimal configuration
+      logger.debug('Creating new page...');
+      page = await this.browser.newPage();
+      logger.debug('Page created successfully');
 
-  private async createOptimizedPage(): Promise<Page> {
-    if (!this.browser) throw new Error('Browser not initialized');
+      // Don't set aggressive optimizations that might cause instability
+      // Just set basic viewport
+      await page.setViewport({
+        width: 800,
+        height: 600,
+        deviceScaleFactor: 1
+      });
+      logger.debug('Viewport set');
 
-    const page = await this.browser.newPage();
-    
-    // Optimize page settings
-    await page.setDefaultTimeout(10000);
-    await page.setDefaultNavigationTimeout(10000);
-    
-    // Disable unnecessary features for better performance
-    await page.setRequestInterception(true);
-    page.on('request', (request) => {
-      // Block unnecessary resources
-      const resourceType = request.resourceType();
-      if (['image', 'stylesheet', 'font', 'script'].includes(resourceType)) {
-        // Allow only essential resources for printing
-        if (resourceType === 'stylesheet' || resourceType === 'font') {
-          request.continue();
-        } else {
-          request.abort();
-        }
-      } else {
-        request.continue();
-      }
-    });
+      // Don't disable JavaScript or set aggressive request interception
+      // Keep it simple and stable
 
-    // Set print-optimized viewport
-    await page.setViewport({
-      width: 1000,
-      height: 1000,
-      deviceScaleFactor: 1
-    });
+      // Use original HTML without aggressive optimization
+      const decodedHtml = html; // Use as-is for now
+      logger.debug('HTML prepared');
 
-    return page;
-  }
-
-  private async getPageFromPool(): Promise<Page> {
-    // Wait for available page using semaphore pattern
-    while (this.pagePoolSemaphore >= this.maxPoolSize) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-
-    this.pagePoolSemaphore++;
-
-    if (this.pagePool.length > 0) {
-      const page = this.pagePool.pop()!;
-      try {
-        // Reset page state
-        await page.goto('data:text/html,<html><body></body></html>', { waitUntil: 'domcontentloaded' });
-        return page;
-      } catch (error) {
-        logger.warn('Page from pool is unusable, creating new one:', error);
-        try {
-          await page.close();
-        } catch (closeError) {
-          // Ignore close errors
-        }
-      }
-    }
-
-    // Create new page if pool is empty or page is unusable
-    return await this.createOptimizedPage();
-  }
-
-  private async returnPageToPool(page: Page): Promise<void> {
-    this.pagePoolSemaphore--;
-
-    try {
-      // Clean up page state but keep it alive
-      const pages = await page.browser().pages();
-      if (pages.length > 10) {
-        // If too many pages, close this one
-        await page.close();
-        return;
-      }
-
-      // Reset page for reuse
-      await page.goto('data:text/html,<html><body></body></html>', { 
+      // Set content with very generous timeout
+      logger.debug('Setting page content...');
+      await page.setContent(decodedHtml, {
         waitUntil: 'domcontentloaded',
-        timeout: 5000 
+        timeout: 30000 // Very generous timeout
       });
-      
-      if (this.pagePool.length < this.maxPoolSize) {
-        this.pagePool.push(page);
-      } else {
-        await page.close();
+      logger.debug('Page content set successfully');
+
+      // Conservative PDF options
+      const pdfOptions = {
+        // format: 'A4' as const, // Use standard format
+        format: undefined, // Use CSS page size
+        printBackground: true,
+        width: '10in',
+        height: '1in',
+        margin: { top: '0mm', right: '0mm', bottom: '0mm', left: '0mm' },
+        preferCSSPageSize: true,
+        timeout: 30000 // Very generous PDF generation timeout
+      };
+
+      logger.debug('Starting PDF generation...');
+
+      // Simple approach: generate each copy separately (most stable)
+      for (let i = 0; i < copies; i++) {
+        logger.debug(`Generating PDF for copy ${i + 1}/${copies}...`);
+
+        const pdfBuffer = await page.pdf(pdfOptions);
+        logger.debug(`PDF generated successfully for copy ${i + 1}`);
+
+        const timestamp = Date.now();
+        const pdfFileName = `conservative_${timestamp}_${i + 1}.pdf`;
+        const tmpDir = join(process.cwd(), 'tmp');
+        const pdfFilePath = join(tmpDir, pdfFileName);
+
+        if (!existsSync(tmpDir)) {
+          require('fs').mkdirSync(tmpDir, { recursive: true });
+        }
+
+        writeFileSync(pdfFilePath, pdfBuffer);
+        logger.debug(`PDF file written: ${pdfFilePath}`);
+
+        const binDir = join(process.cwd(), 'bin');
+        const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
+        const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${printerName}"`;
+
+        logger.debug(`Executing print command for copy ${i + 1}...`);
+        await execAsync(printCommand, { timeout: 15000 });
+        logger.debug(`Print command completed for copy ${i + 1}`);
+
+        // Cleanup
+        setTimeout(() => {
+          try {
+            if (existsSync(pdfFilePath)) {
+              unlinkSync(pdfFilePath);
+            }
+          } catch (cleanupError) {
+            logger.debug('Cleanup error (ignored):', cleanupError);
+          }
+        }, 5000);
+
+        // Small delay between copies
+        if (i < copies - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
       }
-    } catch (error) {
-      logger.warn('Error returning page to pool:', error);
+
+      const totalTime = Date.now() - startTime;
+      logger.info(`✅ ULTRA-CONSERVATIVE: ${copies} copies in ${totalTime}ms (${Math.round(totalTime / copies)}ms/copy)`);
+
+    } catch (error: any) {
+      logger.error(`❌ Ultra-conservative method failed: ${error.message}`);
+      logger.error('Error stack:', error.stack);
+
+      // Log browser and page state for debugging
       try {
-        await page.close();
-      } catch (closeError) {
-        // Ignore close errors
+        if (this.browser) {
+          const pages = await this.browser.pages();
+          logger.debug(`Browser state: connected=${this.browser.connected}, pages=${pages.length}`);
+        }
+        if (page && !page.isClosed()) {
+          logger.debug('Page state: not closed');
+        } else {
+          logger.debug('Page state: closed or null');
+        }
+      } catch (stateError) {
+        logger.debug('Error checking browser/page state:', stateError);
+      }
+
+      throw error;
+    } finally {
+      // Always close the page with extensive error handling
+      if (page) {
+        try {
+          if (!page.isClosed()) {
+            logger.debug('Closing page...');
+            await page.close();
+            logger.debug('Page closed successfully');
+          } else {
+            logger.debug('Page was already closed');
+          }
+        } catch (closeError: any) {
+          logger.warn('Error closing page:', closeError.message);
+        }
       }
     }
   }
 
+  // 3. Simplified browser health check
   private startBrowserHealthCheck(): void {
     this.browserHealthInterval = setInterval(async () => {
       try {
         if (!this.browser || !this.browser.connected) {
           logger.warn('Browser disconnected, reinitializing...');
-          await this.reinitializeBrowser();
+          await this.reinitializeBrowserConservative();
           return;
         }
 
-        // Test browser responsiveness
+        // Just check basic browser health
         const pages = await this.browser.pages();
+        logger.debug(`Browser health check: ${pages.length} pages`);
+
+        // Conservative cleanup - only if we have way too many pages
         if (pages.length > 20) {
-          logger.warn(`Too many pages open (${pages.length}), cleaning up...`);
-          // Close excess pages but keep the first few
-          for (let i = 10; i < pages.length; i++) {
+          logger.warn(`Too many pages (${pages.length}), cleaning up excess...`);
+          const pagesToClose = pages.slice(5); // Keep first 5 pages
+
+          for (const page of pagesToClose) {
             try {
-              await pages[i].close();
-            } catch (error) {
-              // Ignore close errors
+              await page.close();
+            } catch (closeError) {
+              logger.debug('Error closing excess page:', closeError);
             }
           }
         }
 
-        // Memory check
-        const memUsage = process.memoryUsage();
-        if (memUsage.heapUsed > 1024 * 1024 * 1024) { // 1GB
-          logger.warn('High memory usage detected, consider browser restart');
-        }
-
-      } catch (error) {
+      } catch (error: any) {
         logger.error('Browser health check failed:', error);
-        await this.reinitializeBrowser();
+        // Don't automatically reinitialize on health check failure
+        // Let it try to recover naturally
       }
-    }, 30000); // Check every 30 seconds
+    }, 60000); // Check every minute
   }
 
-  private async reinitializeBrowser(): Promise<void> {
-    logger.info('Reinitializing browser...');
-    
-    try {
-      // Clear page pool
-      this.pagePool = [];
-      this.pagePoolSemaphore = 0;
+  // 4. Conservative browser reinitialization
+  private async reinitializeBrowserConservative(): Promise<void> {
+    logger.info('🔄 Reinitializing browser (ultra-conservative mode)...');
 
-      // Close old browser
+    try {
+      // Close old browser with timeout
       if (this.browser) {
         try {
-          await this.browser.close();
-        } catch (error) {
-          logger.warn('Error closing old browser:', error);
+          const closePromise = this.browser.close();
+          await Promise.race([
+            closePromise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Browser close timeout')), 10000))
+          ]);
+          logger.debug('Old browser closed successfully');
+        } catch (error: any) {
+          logger.warn('Error/timeout closing old browser:', error.message);
+          // Continue anyway
         }
       }
 
-      // Wait a moment for cleanup
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Wait for cleanup
+      await new Promise(resolve => setTimeout(resolve, 3000));
 
-      // Initialize new browser
+      // Reinitialize browser
       await this.initializePuppeteer();
-      await this.initializePagePool();
-      
-      logger.info('Browser reinitialized successfully');
-    } catch (error) {
-      logger.error('Failed to reinitialize browser:', error);
-      throw error;
-    }
-  }
 
-  public async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
-    if (!this.browser || !this.browser.connected) {
-      throw new Error('Browser not available');
-    }
-
-    logger.info(`=== PUPPETEER PRIMARY METHOD ===`);
-    const puppeteerStartTime = Date.now();
-
-    let page: Page | null = null;
-
-    try {
-      page = await this.getPageFromPool();
-
-      // Set content with optimized loading
-      await page.setContent(html, { 
-        waitUntil: 'domcontentloaded', // Faster than 'networkidle0'
-        timeout: 10000 
-      });
-
-      // Configure PDF options (optimized for labels)
-      const pdfOptions = {
-        printBackground: true,
-        width: '10in',
-        height: '1in',
-        margin: {
-          top: '0mm',
-          right: '0mm',
-          bottom: '0mm',
-          left: '0mm'
-        },
-        preferCSSPageSize: true,
-        format: undefined // Use CSS page size
-      };
-
-      // Batch process copies more efficiently
-      const batchSize = Math.min(copies, 5); // Process in batches of 5
-      const batches = Math.ceil(copies / batchSize);
-
-      for (let batch = 0; batch < batches; batch++) {
-        const batchStart = batch * batchSize;
-        const batchEnd = Math.min(batchStart + batchSize, copies);
-        const batchCopies = batchEnd - batchStart;
-
-        const batchPromises: Promise<void>[] = [];
-
-        for (let i = 0; i < batchCopies; i++) {
-          batchPromises.push(this.processSingleCopy(page, pdfOptions, printerName, batchStart + i + 1));
-        }
-
-        // Process batch in parallel
-        await Promise.all(batchPromises);
-
-        // Small delay between batches
-        if (batch < batches - 1) {
-          await new Promise(resolve => setTimeout(resolve, 200));
-        }
-      }
-
-      const puppeteerTime = Date.now() - puppeteerStartTime;
-      logger.info(`✅ PUPPETEER PRIMARY: ${copies} copies printed in ${puppeteerTime}ms (avg: ${Math.round(puppeteerTime / copies)}ms per copy)`);
-
+      logger.info('✅ Browser reinitialized successfully (ultra-conservative mode)');
     } catch (error: any) {
-      logger.error(`❌ Puppeteer primary method failed: ${error.message}`);
-      throw error;
-    } finally {
-      if (page) {
-        await this.returnPageToPool(page);
-      }
-    }
-  }
-
-  private async processSingleCopy(page: Page, pdfOptions: any, printerName: string, copyNumber: number): Promise<void> {
-    const copyStartTime = Date.now();
-
-    try {
-      // Generate PDF buffer
-      const pdfBuffer = await page.pdf(pdfOptions);
-
-      // Create temporary PDF file with better naming
-      const timestamp = Date.now();
-      const randomId = Math.random().toString(36).substr(2, 6);
-      const pdfFileName = `print_${timestamp}_${randomId}_c${copyNumber}.pdf`;
-      const tmpDir = join(process.cwd(), 'tmp');
-      
-      if (!existsSync(tmpDir)) {
-        require('fs').mkdirSync(tmpDir, { recursive: true });
-      }
-      
-      const pdfFilePath = join(tmpDir, pdfFileName);
-
-      // Write PDF to file
-      writeFileSync(pdfFilePath, pdfBuffer);
-
-      // Print PDF using PDFtoPrinter.exe
-      const binDir = join(process.cwd(), 'bin');
-      const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
-      const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${printerName}"`;
-
-      await execAsync(printCommand, { timeout: 10000 });
-
-      // Schedule cleanup (async)
-      setTimeout(() => {
-        try {
-          if (existsSync(pdfFilePath)) {
-            unlinkSync(pdfFilePath);
-          }
-        } catch (cleanupError) {
-          logger.warn(`Failed to cleanup PDF file:`, cleanupError);
-        }
-      }, 5000);
-
-      const copyDuration = Date.now() - copyStartTime;
-      logger.debug(`⚡ Puppeteer copy ${copyNumber}: ${copyDuration}ms`);
-
-    } catch (error: any) {
-      logger.error(`❌ Failed to process copy ${copyNumber}: ${error.message}`);
+      logger.error('❌ Failed to reinitialize browser (ultra-conservative mode):', error);
       throw error;
     }
   }
 
-  public getBrowserStatus(): { available: boolean, error?: string, stats?: any } {
+  // 5. Updated getBrowserStatus
+  public getBrowserStatus(): { available: boolean, error?: string, stats?: any; } {
     try {
       if (!this.browser) {
         return { available: false, error: 'Browser not initialized' };
       }
-      
+
       if (!this.browser.connected) {
         return { available: false, error: 'Browser disconnected' };
       }
-      
-      return { 
-        available: true, 
+
+      return {
+        available: true,
         stats: {
-          pagePoolSize: this.pagePool.length,
-          activeSemaphore: this.pagePoolSemaphore,
-          memoryUsage: process.memoryUsage()
+          mode: 'ultra-conservative',
+          pagePoolEnabled: false,
+          memoryUsage: process.memoryUsage(),
+          browserConnected: this.browser.connected
         }
       };
     } catch (error: any) {
       return { available: false, error: error.message };
     }
   }
+
+  // 6. Alternative: Test with wkhtmltopdf primary method temporarily
+  // Add this method to test if the issue is Puppeteer-specific
+  public async printLabelWkhtmltopdfOnly(printerName: string, htmlContent: string, metadata: Partial<PrintMetadata>): Promise<void> {
+    const copies = metadata.copies || 1;
+    const printer: PrinterStatus | undefined = this.printers.get(printerName);
+    if (!printer || printer.status !== 'online') {
+      throw new Error(`Printer ${printerName} is not available`);
+    }
+
+    try {
+      // Decode base64 HTML content
+      const decodedHtml: string = Buffer.from(htmlContent, 'base64').toString('utf8');
+
+      // Create enhanced HTML with print-specific CSS
+      const enhancedHtml = this.enhanceHtmlForPrinting(decodedHtml);
+
+      const totalStartTime = Date.now();
+
+      // Use wkhtmltopdf only for testing
+      if (this.wkhtmltopdfPath) {
+        logger.info(`=== WKHTMLTOPDF ONLY TEST ===`);
+        await this.printWithWkhtmltopdf(enhancedHtml, printerName, copies, metadata);
+      } else {
+        throw new Error('wkhtmltopdf not available');
+      }
+
+      const totalTime = Date.now() - totalStartTime;
+      logger.info(`📊 WKHTMLTOPDF ONLY: ${copies} copies completed in ${totalTime}ms`);
+
+      logger.info(`Successfully printed ${copies} copies to ${printerName} (wkhtmltopdf only)`);
+    } catch (error: any) {
+      logger.error(`Print failed for printer ${printerName} (wkhtmltopdf only):`, error);
+      throw error;
+    }
+  }
+
+
+
 
   public destroy(): void {
     if (this.healthCheckInterval) {
@@ -579,7 +544,7 @@ export class PrinterService {
 
     // Clean up page pool
     this.pagePool.forEach(page => {
-      page.close().catch(() => {});
+      page.close().catch(() => { });
     });
     this.pagePool = [];
 
@@ -685,14 +650,14 @@ export class PrinterService {
   private enhanceHtmlForPrinting(html: string): string {
     // Add print-specific CSS if not already present
     const printCss = `
-      <style>
-        @media print {
-          body { margin: 0; padding: 0; }
-          @page { margin: 0; size: auto; }
-          * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; }
-        }
-      </style>
-    `;
+    <style>
+      @media print {
+        body { margin: 0; padding: 0; }
+        @page { margin: 0; size: auto; }
+        * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; }
+      }
+    </style>
+  `;
 
     // Check if HTML already has print styles
     if (!html.toLowerCase().includes('@media print') && !html.toLowerCase().includes('@page')) {
@@ -700,7 +665,7 @@ export class PrinterService {
       if (html.toLowerCase().includes('</head>')) {
         return html.replace(/<\/head>/i, `${printCss}</head>`);
       } else if (html.toLowerCase().includes('<html>')) {
-        return html.replace(/<html[^>]*>/i, `  // ... rest of your existing methods remain the same${printCss}`);
+        return html.replace(/<html[^>]*>/i, `$&${printCss}`); // Fixed this line
       } else {
         return `${printCss}${html}`;
       }
@@ -789,6 +754,18 @@ export class PrinterService {
       logger.error(`Reset media values failed for printer ${printerName}:`, error);
       return false;
     }
+  }
+
+  public getPerformanceStats(): any {
+    return {
+      browserConnected: this.browser?.connected || false,
+      pagePoolSize: this.pagePool.length,
+      maxPoolSize: this.maxPoolSize,
+      activeSemaphore: this.pagePoolSemaphore,
+      memoryUsage: process.memoryUsage(),
+      printersOnline: Array.from(this.printers.values()).filter(p => p.status === 'online').length,
+      totalPrinters: this.printers.size
+    };
   }
 
   public async testPrint(printerName: string): Promise<boolean> {
