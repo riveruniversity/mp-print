@@ -13,7 +13,7 @@ export const config = {
     keepAliveTimeout: parseNumber(process.env.KEEP_ALIVE_TIMEOUT, 5000)
   },
   security: {
-    allowedOrigins: parseArray(process.env.ALLOWED_ORIGINS, ['http://localhost:3000','http://localhost:8080']),
+    allowedOrigins: parseArray(process.env.ALLOWED_ORIGINS, ['http://localhost:3000', 'http://localhost:8080']),
     rateLimitWindowMs: parseNumber(process.env.RATE_LIMIT_WINDOW_MS, 900000), // 15 minutes
     rateLimitMax: parseNumber(process.env.RATE_LIMIT_MAX, 1000)
   },
@@ -25,7 +25,11 @@ export const config = {
     batchSize: parseNumber(process.env.BATCH_SIZE, 10),
     maxConcurrentJobs: parseNumber(process.env.MAX_CONCURRENT_JOBS, 50),
     printerHealthCheckInterval: parseNumber(process.env.PRINTER_HEALTH_CHECK_INTERVAL, 30000),
-    ieTimeout: parseNumber(process.env.IE_PRINT_TIMEOUT, 10000) // Now used for Edge timeout
+    ieTimeout: parseNumber(process.env.IE_PRINT_TIMEOUT, 10000),
+    puppeteerPagePoolSize: parseNumber(process.env.PUPPETEER_PAGE_POOL_SIZE, 5),
+    puppeteerBrowserHealthInterval: parseNumber(process.env.PUPPETEER_HEALTH_INTERVAL, 30000),
+    puppeteerMaxPages: parseNumber(process.env.PUPPETEER_MAX_PAGES, 20),
+    puppeteerBatchSize: parseNumber(process.env.PUPPETEER_BATCH_SIZE, 5)
   },
   logging: {
     level: process.env.LOG_LEVEL || 'info',

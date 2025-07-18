@@ -1,3 +1,5 @@
+// Enhanced PrinterService.ts with optimized Puppeteer usage
+
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
@@ -14,32 +16,20 @@ export class PrinterService {
   private healthCheckInterval?: ReturnType<typeof setInterval>;
   private browser?: Browser;
   private wkhtmltopdfPath?: string;
+  
+  // Page pool for better performance
+  private pagePool: Page[] = [];
+  private maxPoolSize: number = 5;
+  private pagePoolSemaphore: number = 0;
+  private browserHealthInterval?: ReturnType<typeof setInterval>;
 
   public async initialize(): Promise<void> {
     await this.findWkhtmltopdf();
     await this.initializePuppeteer();
+    await this.initializePagePool();
     await this.discoverPrinters();
     this.startHealthCheck();
-  }
-
-  private async initializePuppeteer(): Promise<void> {
-    try {
-      this.browser = await puppeteer.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-web-security',
-          '--disable-features=VizDisplayCompositor',
-        ]
-      });
-      logger.info('Puppeteer browser initialized successfully');
-    } catch (error) {
-      logger.error('Failed to initialize Puppeteer:', error);
-      throw new Error('Puppeteer initialization failed');
-    }
+    this.startBrowserHealthCheck();
   }
 
   private async findWkhtmltopdf(): Promise<void> {
@@ -211,24 +201,252 @@ export class PrinterService {
     }
   }
 
+  private async initializePuppeteer(): Promise<void> {
+    try {
+      this.browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
+          '--disable-extensions',
+          '--disable-plugins',
+          '--disable-default-apps',
+          '--disable-background-networking',
+          '--disable-sync',
+          '--disable-translate',
+          '--hide-scrollbars',
+          '--mute-audio',
+          '--no-first-run',
+          '--disable-ipc-flooding-protection',
+          // Memory optimizations
+          '--memory-pressure-off',
+          '--max_old_space_size=4096',
+          // Performance optimizations
+          '--single-process', // Use single process for better resource management
+        ],
+        // Keep browser alive longer
+        timeout: 0,
+        protocolTimeout: 60000,
+      });
 
-  private async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
-    if (!this.browser) {
-      throw new Error('Puppeteer browser not initialized');
+      // Keep browser alive with a dummy page
+      const keepAlivePage = await this.browser.newPage();
+      await keepAlivePage.goto('data:text/html,<html><body>Keep Alive</body></html>');
+      
+      logger.info('Puppeteer browser initialized successfully with optimizations');
+    } catch (error) {
+      logger.error('Failed to initialize Puppeteer:', error);
+      throw new Error('Puppeteer initialization failed');
+    }
+  }
+
+  private async initializePagePool(): Promise<void> {
+    if (!this.browser) return;
+
+    try {
+      // Pre-create pages for the pool
+      for (let i = 0; i < this.maxPoolSize; i++) {
+        const page = await this.createOptimizedPage();
+        this.pagePool.push(page);
+      }
+      logger.info(`Initialized page pool with ${this.maxPoolSize} pages`);
+    } catch (error) {
+      logger.error('Failed to initialize page pool:', error);
+    }
+  }
+
+  private async createOptimizedPage(): Promise<Page> {
+    if (!this.browser) throw new Error('Browser not initialized');
+
+    const page = await this.browser.newPage();
+    
+    // Optimize page settings
+    await page.setDefaultTimeout(10000);
+    await page.setDefaultNavigationTimeout(10000);
+    
+    // Disable unnecessary features for better performance
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      // Block unnecessary resources
+      const resourceType = request.resourceType();
+      if (['image', 'stylesheet', 'font', 'script'].includes(resourceType)) {
+        // Allow only essential resources for printing
+        if (resourceType === 'stylesheet' || resourceType === 'font') {
+          request.continue();
+        } else {
+          request.abort();
+        }
+      } else {
+        request.continue();
+      }
+    });
+
+    // Set print-optimized viewport
+    await page.setViewport({
+      width: 1000,
+      height: 1000,
+      deviceScaleFactor: 1
+    });
+
+    return page;
+  }
+
+  private async getPageFromPool(): Promise<Page> {
+    // Wait for available page using semaphore pattern
+    while (this.pagePoolSemaphore >= this.maxPoolSize) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    this.pagePoolSemaphore++;
+
+    if (this.pagePool.length > 0) {
+      const page = this.pagePool.pop()!;
+      try {
+        // Reset page state
+        await page.goto('data:text/html,<html><body></body></html>', { waitUntil: 'domcontentloaded' });
+        return page;
+      } catch (error) {
+        logger.warn('Page from pool is unusable, creating new one:', error);
+        try {
+          await page.close();
+        } catch (closeError) {
+          // Ignore close errors
+        }
+      }
+    }
+
+    // Create new page if pool is empty or page is unusable
+    return await this.createOptimizedPage();
+  }
+
+  private async returnPageToPool(page: Page): Promise<void> {
+    this.pagePoolSemaphore--;
+
+    try {
+      // Clean up page state but keep it alive
+      const pages = await page.browser().pages();
+      if (pages.length > 10) {
+        // If too many pages, close this one
+        await page.close();
+        return;
+      }
+
+      // Reset page for reuse
+      await page.goto('data:text/html,<html><body></body></html>', { 
+        waitUntil: 'domcontentloaded',
+        timeout: 5000 
+      });
+      
+      if (this.pagePool.length < this.maxPoolSize) {
+        this.pagePool.push(page);
+      } else {
+        await page.close();
+      }
+    } catch (error) {
+      logger.warn('Error returning page to pool:', error);
+      try {
+        await page.close();
+      } catch (closeError) {
+        // Ignore close errors
+      }
+    }
+  }
+
+  private startBrowserHealthCheck(): void {
+    this.browserHealthInterval = setInterval(async () => {
+      try {
+        if (!this.browser || !this.browser.connected) {
+          logger.warn('Browser disconnected, reinitializing...');
+          await this.reinitializeBrowser();
+          return;
+        }
+
+        // Test browser responsiveness
+        const pages = await this.browser.pages();
+        if (pages.length > 20) {
+          logger.warn(`Too many pages open (${pages.length}), cleaning up...`);
+          // Close excess pages but keep the first few
+          for (let i = 10; i < pages.length; i++) {
+            try {
+              await pages[i].close();
+            } catch (error) {
+              // Ignore close errors
+            }
+          }
+        }
+
+        // Memory check
+        const memUsage = process.memoryUsage();
+        if (memUsage.heapUsed > 1024 * 1024 * 1024) { // 1GB
+          logger.warn('High memory usage detected, consider browser restart');
+        }
+
+      } catch (error) {
+        logger.error('Browser health check failed:', error);
+        await this.reinitializeBrowser();
+      }
+    }, 30000); // Check every 30 seconds
+  }
+
+  private async reinitializeBrowser(): Promise<void> {
+    logger.info('Reinitializing browser...');
+    
+    try {
+      // Clear page pool
+      this.pagePool = [];
+      this.pagePoolSemaphore = 0;
+
+      // Close old browser
+      if (this.browser) {
+        try {
+          await this.browser.close();
+        } catch (error) {
+          logger.warn('Error closing old browser:', error);
+        }
+      }
+
+      // Wait a moment for cleanup
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Initialize new browser
+      await this.initializePuppeteer();
+      await this.initializePagePool();
+      
+      logger.info('Browser reinitialized successfully');
+    } catch (error) {
+      logger.error('Failed to reinitialize browser:', error);
+      throw error;
+    }
+  }
+
+  public async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+    if (!this.browser || !this.browser.connected) {
+      throw new Error('Browser not available');
     }
 
     logger.info(`=== PUPPETEER PRIMARY METHOD ===`);
     const puppeteerStartTime = Date.now();
 
+    let page: Page | null = null;
+
     try {
-      const page: Page = await this.browser.newPage();
+      page = await this.getPageFromPool();
 
-      // Set page content
-      await page.setContent(html, { waitUntil: 'networkidle0' });
+      // Set content with optimized loading
+      await page.setContent(html, { 
+        waitUntil: 'domcontentloaded', // Faster than 'networkidle0'
+        timeout: 10000 
+      });
 
-      // Configure PDF options
+      // Configure PDF options (optimized for labels)
       const pdfOptions = {
-        // format: 'A4' as const,
         printBackground: true,
         width: '10in',
         height: '1in',
@@ -237,62 +455,34 @@ export class PrinterService {
           right: '0mm',
           bottom: '0mm',
           left: '0mm'
-        }
+        },
+        preferCSSPageSize: true,
+        format: undefined // Use CSS page size
       };
 
-      // Override format if custom dimensions are needed
-      // if (metadata?.paperSize) {
-      //   pdfOptions.format = metadata.paperSize as any;
-      // }
+      // Batch process copies more efficiently
+      const batchSize = Math.min(copies, 5); // Process in batches of 5
+      const batches = Math.ceil(copies / batchSize);
 
-      // Generate PDF for each copy
-      for (let i = 0; i < copies; i++) {
-        const copyStartTime = Date.now();
+      for (let batch = 0; batch < batches; batch++) {
+        const batchStart = batch * batchSize;
+        const batchEnd = Math.min(batchStart + batchSize, copies);
+        const batchCopies = batchEnd - batchStart;
 
-        // Generate PDF buffer
-        const pdfBuffer = await page.pdf(pdfOptions);
+        const batchPromises: Promise<void>[] = [];
 
-        // Create temporary PDF file
-        const timestamp = Date.now();
-        const randomId = Math.random().toString(36).substr(2, 9);
-        const pdfFileName = `temp_${timestamp}_${randomId}_copy${i + 1}.pdf`;
-        const tmpDir = join(process.cwd(), 'tmp');
-        if (!existsSync(tmpDir)) {
-          require('fs').mkdirSync(tmpDir, { recursive: true });
+        for (let i = 0; i < batchCopies; i++) {
+          batchPromises.push(this.processSingleCopy(page, pdfOptions, printerName, batchStart + i + 1));
         }
-        const pdfFilePath = join(tmpDir, pdfFileName);
 
-        // Write PDF to file
-        writeFileSync(pdfFilePath, pdfBuffer);
+        // Process batch in parallel
+        await Promise.all(batchPromises);
 
-        // Print PDF using PDFtoPrinter.exe
-        const binDir = join(process.cwd(), 'bin');
-        const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
-        const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${printerName}"`;
-
-        await execAsync(printCommand, { timeout: 10000 });
-
-        // Clean up PDF file
-        setTimeout(() => {
-          try {
-            if (existsSync(pdfFilePath)) {
-              unlinkSync(pdfFilePath);
-            }
-          } catch (cleanupError) {
-            logger.warn(`Failed to cleanup PDF file:`, cleanupError);
-          }
-        }, 2000);
-
-        const copyDuration = Date.now() - copyStartTime;
-        logger.debug(`⚡ Puppeteer copy ${i + 1}/${copies}: ${copyDuration}ms`);
-
-        // Small delay between copies
-        if (i < copies - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+        // Small delay between batches
+        if (batch < batches - 1) {
+          await new Promise(resolve => setTimeout(resolve, 200));
         }
       }
-
-      await page.close();
 
       const puppeteerTime = Date.now() - puppeteerStartTime;
       logger.info(`✅ PUPPETEER PRIMARY: ${copies} copies printed in ${puppeteerTime}ms (avg: ${Math.round(puppeteerTime / copies)}ms per copy)`);
@@ -300,6 +490,103 @@ export class PrinterService {
     } catch (error: any) {
       logger.error(`❌ Puppeteer primary method failed: ${error.message}`);
       throw error;
+    } finally {
+      if (page) {
+        await this.returnPageToPool(page);
+      }
+    }
+  }
+
+  private async processSingleCopy(page: Page, pdfOptions: any, printerName: string, copyNumber: number): Promise<void> {
+    const copyStartTime = Date.now();
+
+    try {
+      // Generate PDF buffer
+      const pdfBuffer = await page.pdf(pdfOptions);
+
+      // Create temporary PDF file with better naming
+      const timestamp = Date.now();
+      const randomId = Math.random().toString(36).substr(2, 6);
+      const pdfFileName = `print_${timestamp}_${randomId}_c${copyNumber}.pdf`;
+      const tmpDir = join(process.cwd(), 'tmp');
+      
+      if (!existsSync(tmpDir)) {
+        require('fs').mkdirSync(tmpDir, { recursive: true });
+      }
+      
+      const pdfFilePath = join(tmpDir, pdfFileName);
+
+      // Write PDF to file
+      writeFileSync(pdfFilePath, pdfBuffer);
+
+      // Print PDF using PDFtoPrinter.exe
+      const binDir = join(process.cwd(), 'bin');
+      const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
+      const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${printerName}"`;
+
+      await execAsync(printCommand, { timeout: 10000 });
+
+      // Schedule cleanup (async)
+      setTimeout(() => {
+        try {
+          if (existsSync(pdfFilePath)) {
+            unlinkSync(pdfFilePath);
+          }
+        } catch (cleanupError) {
+          logger.warn(`Failed to cleanup PDF file:`, cleanupError);
+        }
+      }, 5000);
+
+      const copyDuration = Date.now() - copyStartTime;
+      logger.debug(`⚡ Puppeteer copy ${copyNumber}: ${copyDuration}ms`);
+
+    } catch (error: any) {
+      logger.error(`❌ Failed to process copy ${copyNumber}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  public getBrowserStatus(): { available: boolean, error?: string, stats?: any } {
+    try {
+      if (!this.browser) {
+        return { available: false, error: 'Browser not initialized' };
+      }
+      
+      if (!this.browser.connected) {
+        return { available: false, error: 'Browser disconnected' };
+      }
+      
+      return { 
+        available: true, 
+        stats: {
+          pagePoolSize: this.pagePool.length,
+          activeSemaphore: this.pagePoolSemaphore,
+          memoryUsage: process.memoryUsage()
+        }
+      };
+    } catch (error: any) {
+      return { available: false, error: error.message };
+    }
+  }
+
+  public destroy(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+    if (this.browserHealthInterval) {
+      clearInterval(this.browserHealthInterval);
+    }
+
+    // Clean up page pool
+    this.pagePool.forEach(page => {
+      page.close().catch(() => {});
+    });
+    this.pagePool = [];
+
+    if (this.browser) {
+      this.browser.close().catch(error => {
+        logger.error('Error closing Puppeteer browser:', error);
+      });
     }
   }
 
@@ -395,7 +682,6 @@ export class PrinterService {
     }
   }
 
-
   private enhanceHtmlForPrinting(html: string): string {
     // Add print-specific CSS if not already present
     const printCss = `
@@ -414,7 +700,7 @@ export class PrinterService {
       if (html.toLowerCase().includes('</head>')) {
         return html.replace(/<\/head>/i, `${printCss}</head>`);
       } else if (html.toLowerCase().includes('<html>')) {
-        return html.replace(/<html[^>]*>/i, `$&${printCss}`);
+        return html.replace(/<html[^>]*>/i, `  // ... rest of your existing methods remain the same${printCss}`);
       } else {
         return `${printCss}${html}`;
       }
@@ -533,17 +819,6 @@ export class PrinterService {
     } catch (error) {
       logger.error(`Test print failed for ${printerName}:`, error);
       return false;
-    }
-  }
-
-  public destroy(): void {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-    }
-    if (this.browser) {
-      this.browser.close().catch(error => {
-        logger.error('Error closing Puppeteer browser:', error);
-      });
     }
   }
 }
