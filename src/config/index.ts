@@ -13,7 +13,7 @@ export const config = {
     keepAliveTimeout: parseNumber(process.env.KEEP_ALIVE_TIMEOUT, 5000)
   },
   security: {
-    allowedOrigins: parseArray(process.env.ALLOWED_ORIGINS, ['http://localhost:3000']),
+    allowedOrigins: parseArray(process.env.ALLOWED_ORIGINS, ['http://localhost:3000','http://localhost:8080']),
     rateLimitWindowMs: parseNumber(process.env.RATE_LIMIT_WINDOW_MS, 900000), // 15 minutes
     rateLimitMax: parseNumber(process.env.RATE_LIMIT_MAX, 1000)
   },

@@ -28,10 +28,15 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   let printService: PrintService;
 
   // trust the entire private network:
-  app.set('trust proxy', ['loopback', '10.0.0.0/8']);
+  app.set('trust proxy', ['loopback', '10.0.0.0/8', '127.0.0.1', '::1']);
 
   // Security middleware
-  app.use(helmet());
+  app.use(helmet({
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: false,
+    contentSecurityPolicy: false
+  }));
+
   // app.use(cors({
   //   origin: config.security.allowedOrigins,
   //   credentials: true,
@@ -46,12 +51,12 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     const origin = req.headers.origin;
     const allowedOrigins = config.security.allowedOrigins;
 
-    if (allowedOrigins.includes(origin || '')) {
-      res.header('Access-Control-Allow-Origin', origin);
+    if (allowedOrigins.includes(origin || '') || !origin) {
+      res.header('Access-Control-Allow-Origin', origin || '*');
     }
 
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Forwarded-For');
     res.header('Access-Control-Allow-Credentials', 'true');
 
     // This is the key header for private network requests
@@ -67,6 +72,8 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
     next();
   });
+
+
 
   // Rate limiting
   const limiter = rateLimit({
@@ -91,8 +98,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     next();
   });
 
-
   app.use('/api/', limiter);
+
+
 
   // Body parsing and compression
   app.use(compression());
@@ -151,7 +159,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
   // Start server
   const server = app.listen(config.server.port, config.server.host, async (): Promise<void> => {
-    logger.info(`Print server running on ${config.server.host}:${config.server.port}`);
+    logger.info(`🗄️  Print server running on ${config.server.host}:${config.server.port}`);
 
     // Initialize print service
     try {
