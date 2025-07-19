@@ -33,8 +33,8 @@ export class QueueService extends EventEmitter {
       .sort((a: PrintJob, b: PrintJob): number => {
         // Priority sorting: high > medium > low, then by timestamp
         const priorityOrder: Record<PrintPriority, number> = { high: 3, medium: 2, low: 1 };
-        const aPriority: number = priorityOrder[a.request.metadata.priority];
-        const bPriority: number = priorityOrder[b.request.metadata.priority];
+        const aPriority: number = priorityOrder[a.request.metadata.priority ?? 'medium'];
+        const bPriority: number = priorityOrder[b.request.metadata.priority ?? 'medium'];
         
         if (aPriority !== bPriority) {
           return bPriority - aPriority;
