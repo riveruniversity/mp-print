@@ -21,13 +21,12 @@ export class PrinterService {
   private healthCheckInterval?: ReturnType<typeof setInterval>;
 
   public async initialize(): Promise<void> {
-    this.browserService.initialize();
+    await this.browserService.initialize();
     this.browser = this.browserService.browser;
 
     await this.discoverPrinters();
     this.startHealthCheck();
   }
-
 
 
   private async discoverPrinters(): Promise<void> {
@@ -179,7 +178,11 @@ export class PrinterService {
 
   private async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
     if (!this.browser || !this.browser.connected) {
-      throw new Error('Browser not available');
+      await this.browserService.reinitializeBrowser();
+      this.browser = this.browserService.browser;
+      if (!this.browser || !this.browser.connected) {
+        throw new Error('Browser not available');
+      }
     }
 
     logger.info(`=== ULTRA-CONSERVATIVE PUPPETEER ===`);
@@ -249,6 +252,12 @@ export class PrinterService {
         logger.debug(`Executing print command for copy ${i + 1}...`);
         await execAsync(printCommand, { timeout: 15000 });
         logger.debug(`Print command completed for copy ${i + 1}`);
+
+        // Explicit cleanup for large buffers
+        if (pdfBuffer.length > 1024 * 1024) { // If > 1MB
+          // Force garbage collection hint
+          if (global.gc) global.gc();
+        }
 
         // Cleanup
         setTimeout(() => {
@@ -564,9 +573,6 @@ export class PrinterService {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
     }
-
-
-
 
     if (this.browser) {
       this.browser.close().catch(error => {

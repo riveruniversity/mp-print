@@ -14,11 +14,6 @@ export class BrowserService {
   public wkhtmltopdfPath?: string;
   private chromePath: string | undefined;
 
-  // Page pool for better performance
-  private pagePool: Page[] = [];
-  private maxPoolSize: number = 5;
-  private pagePoolSemaphore: number = 0;
-
   private browserHealthInterval?: ReturnType<typeof setInterval>;
 
 
@@ -26,18 +21,10 @@ export class BrowserService {
   public async initialize(): Promise<void> {
     await this.findWkhtmltopdf();
     await this.initializePuppeteer();
-    await this.initializePagePool();
 
     this.startBrowserHealthCheck();
   }
 
-  private async initializePagePool(): Promise<void> {
-    logger.info('Page pooling disabled for stability - using fresh pages per job');
-    // Don't initialize page pool - we'll create fresh pages for each job
-    this.pagePool = [];
-    this.maxPoolSize = 0;
-    this.pagePoolSemaphore = 0;
-  }
 
   // Puppeteer implementation 
   private async initializePuppeteer(): Promise<void> {
@@ -47,7 +34,7 @@ export class BrowserService {
         'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
       ];
 
-      
+
       for (const path of chromePaths) {
         if (require('fs').existsSync(path)) {
           this.chromePath = path;
@@ -137,42 +124,16 @@ export class BrowserService {
   // browser health check
   private startBrowserHealthCheck(): void {
     this.browserHealthInterval = setInterval(async () => {
-      try {
-        if (!this.browser || !this.browser.connected) {
-          logger.warn('Browser disconnected, reinitializing...');
-          await this.reinitializeBrowserConservative();
-          return;
-        }
-
-        // Just check basic browser health
-        const pages = await this.browser.pages();
-        logger.debug(`Browser health check: ${pages.length} pages`);
-
-        // Conservative cleanup - only if we have way too many pages
-        if (pages.length > 20) {
-          logger.warn(`Too many pages (${pages.length}), cleaning up excess...`);
-          const pagesToClose = pages.slice(5); // Keep first 5 pages
-
-          for (const page of pagesToClose) {
-            try {
-              await page.close();
-            } catch (closeError) {
-              logger.debug('Error closing excess page:', closeError);
-            }
-          }
-        }
-
-      } catch (error: any) {
-        logger.error('Browser health check failed:', error);
-        // Don't automatically reinitialize on health check failure
-        // Let it try to recover naturally
+      if (!this.browser?.connected) {
+        logger.warn('Browser disconnected, marking for reinitialization');
+        this.browser = undefined; // Let next print job reinitialize
       }
-    }, 60000); // Check every minute
+    }, 60000);
   }
 
 
-  // 4. Conservative browser reinitialization
-  private async reinitializeBrowserConservative(): Promise<void> {
+  // Conservative browser reinitialization
+  public async reinitializeBrowser(): Promise<void> {
     logger.info('🔄 Reinitializing browser (ultra-conservative mode)...');
 
     try {
@@ -220,7 +181,6 @@ export class BrowserService {
         stats: {
           mode: 'ultra-conservative',
           pagePoolEnabled: false,
-          memoryUsage: process.memoryUsage(),
           browserConnected: this.browser.connected
         }
       };
@@ -233,21 +193,12 @@ export class BrowserService {
   public getPerformanceStats(): any {
     return {
       browserConnected: this.browser?.connected || false,
-      pagePoolSize: this.pagePool.length,
-      maxPoolSize: this.maxPoolSize,
-      activeSemaphore: this.pagePoolSemaphore,
       memoryUsage: process.memoryUsage(),
     };
   }
 
 
   public destroy(): void {
-
-    // Clean up page pool
-    this.pagePool.forEach(page => {
-      page.close().catch(() => { });
-    });
-    this.pagePool = [];
 
     if (this.browserHealthInterval) {
       clearInterval(this.browserHealthInterval);
@@ -259,8 +210,5 @@ export class BrowserService {
       });
     }
   }
-
-
-
 
 }
