@@ -1,7 +1,4 @@
-// src/server.ts - Updated to use singleton properly
-
 import express, { Application, Request, Response, NextFunction } from 'express';
-import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
@@ -11,6 +8,7 @@ import { config } from './config';
 import logger from './utils/logger';
 import printRoutes, { initializePrintService } from './routes/print';
 import { HealthCheckResponse } from './types';
+import { corsConfig } from './middleware/cors';
 
 if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   const numWorkers: number = config.server.workers;
@@ -38,29 +36,7 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   }));
 
   // CORS middleware
-  app.use((req: Request, res: Response, next: NextFunction): void => {
-    const origin = req.headers.origin;
-    const allowedOrigins = config.security.allowedOrigins;
-
-    if (allowedOrigins.includes(origin || '') || !origin) {
-      res.header('Access-Control-Allow-Origin', origin || '*');
-    }
-
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Forwarded-For');
-    res.header('Access-Control-Allow-Credentials', 'true');
-
-    if (req.headers['access-control-request-private-network']) {
-      res.header('Access-Control-Allow-Private-Network', 'true');
-    }
-
-    if (req.method === 'OPTIONS') {
-      res.sendStatus(200);
-      return;
-    }
-
-    next();
-  });
+  app.use(corsConfig);
 
   // Rate limiting
   const limiter = rateLimit({
