@@ -5,7 +5,7 @@ import { promisify } from 'util';
 import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
 import { Browser, Page } from 'puppeteer';
-import { PrinterStatus, PrinterStatusType, PrintMetadata, WindowsPrinter } from '../types';
+import { PrinterStatus, PrinterStatusType, PrintLabel, PrintMetadata, WindowsPrinter } from '../types';
 import { config } from '../config';
 import logger from '../utils/logger';
 import { BrowserService } from './BrowserService';
@@ -124,59 +124,49 @@ export class PrinterService {
     }
   }
 
-  public async printLabel(printerName: string, htmlContent: string, metadata: Partial<PrintMetadata>): Promise<void> {
-    const copies = metadata.copies || 1;
-    const printer: PrinterStatus | undefined = this.printers.get(printerName);
+
+
+
+  public async printLabel(label: PrintLabel, metadata: PrintMetadata): Promise<void> {
+    const printer: PrinterStatus | undefined = this.printers.get(label.printerName);
     if (!printer || printer.status !== 'online') {
-      throw new Error(`Printer ${printerName} is not available`);
+      throw new Error(`Printer ${label.printerName} is not available`);
     }
 
     try {
-      // Decode base64 HTML content
-      const decodedHtml: string = Buffer.from(htmlContent, 'base64').toString('utf8');
-
-      // Create enhanced HTML with print-specific CSS
-      const enhancedHtml = this.enhanceHtmlForPrinting(decodedHtml);
+      const decodedHtml: string = Buffer.from(label.htmlContent, 'base64').toString('utf8');
+      const enhancedHtml = this.enhanceHtmlForPrinting(decodedHtml, label);
 
       const totalStartTime = Date.now();
 
-      // Try Puppeteer first (primary method), fallback to wkhtmltopdf
       if (this.browser) {
         try {
-          await this.printWithPuppeteer(enhancedHtml, printerName, copies, metadata);
+          await this.printWithPuppeteer(enhancedHtml, label, metadata);
         } catch (error) {
           logger.warn(`❌ PUPPETEER FAILED: ${error}, falling back to wkhtmltopdf`);
           if (this.browserService.wkhtmltopdfPath) {
-            await this.printWithWkhtmltopdf(enhancedHtml, printerName, copies, metadata);
+            await this.printWithWkhtmltopdf(enhancedHtml, label, metadata);
           } else {
             throw new Error('Both Puppeteer and wkhtmltopdf are unavailable');
           }
         }
       } else if (this.browserService.wkhtmltopdfPath) {
-        // Use wkhtmltopdf as fallback if Puppeteer is not available
-        logger.info(`=== WKHTMLTOPDF FALLBACK METHOD ===`);
-        await this.printWithWkhtmltopdf(enhancedHtml, printerName, copies, metadata);
+        await this.printWithWkhtmltopdf(enhancedHtml, label, metadata);
       } else {
         throw new Error('Neither Puppeteer nor wkhtmltopdf is available');
       }
 
       const totalTime = Date.now() - totalStartTime;
-      logger.info(`📊 TOTAL PRINT JOB: ${copies} copies completed in ${totalTime}ms`);
+      logger.info(`📊 LABEL PRINT: ${label.copies} copies of "${label.name}" completed in ${totalTime}ms`);
 
-      logger.info(`Successfully printed ${copies} copies to ${printerName}`);
     } catch (error: any) {
-      logger.error(`Print failed for printer ${printerName}:`, error);
+      logger.error(`Print failed for label "${label.name}" on printer ${label.printerName}:`, error);
       throw error;
     }
   }
 
 
-
-
-
-
-
-  private async printWithPuppeteer(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+  private async printWithPuppeteer(html: string, label: PrintLabel, metadata: PrintMetadata): Promise<void> {
     if (!this.browser || !this.browser.connected) {
       await this.browserService.reinitializeBrowser();
       this.browser = this.browserService.browser;
@@ -191,44 +181,42 @@ export class PrinterService {
     let page: Page | null = null;
 
     try {
-      // Create page with minimal configuration
       page = await this.browser.newPage();
 
-      // Just set basic viewport
       await page.setViewport({
         width: 800,
         height: 600,
         deviceScaleFactor: 1
       });
 
-      // Use original HTML without aggressive optimization
-      const decodedHtml = html; // Use as-is 
-
-      // Set content with very generous timeout
       logger.debug('Setting page content...');
-      await page.setContent(decodedHtml, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000 // Very generous timeout
+      await page.setContent(html, {
+        waitUntil: 'networkidle0',
+        timeout: 30000
       });
       logger.debug('Page content set successfully');
 
-      // Conservative PDF options
+      // Use label dimensions instead of hardcoded values
       const pdfOptions = {
-        // format: 'A4' as const, // Use standard format
-        format: undefined, // Use CSS page size
+        format: undefined,
         printBackground: true,
-        width: '10in',
-        height: '1in',
-        margin: { top: '0mm', right: '0mm', bottom: '0mm', left: '0mm' },
+        width: label.width,
+        height: label.height,
+        margin: {
+          top: label.margin.top,
+          right: label.margin.right,
+          bottom: label.margin.bottom,
+          left: label.margin.left
+        },
         preferCSSPageSize: true,
-        timeout: 10000 // generous PDF generation timeout
+        timeout: 10000
       };
 
       logger.debug('Starting PDF generation...');
 
-      // Simple approach: generate each copy separately (most stable)
-      for (let i = 0; i < copies; i++) {
-        logger.debug(`Generating PDF for copy ${i + 1}/${copies}...`);
+      // Generate each copy separately
+      for (let i = 0; i < label.copies; i++) {
+        logger.debug(`Generating PDF for copy ${i + 1}/${label.copies}...`);
 
         const pdfBuffer = await page.pdf(pdfOptions);
         logger.debug(`PDF generated successfully for copy ${i + 1}`);
@@ -247,19 +235,16 @@ export class PrinterService {
 
         const binDir = join(process.cwd(), 'bin');
         const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
-        const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${printerName}"`;
+        const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${label.printerName}"`;
 
         logger.debug(`Executing print command for copy ${i + 1}...`);
         await execAsync(printCommand, { timeout: 15000 });
         logger.debug(`Print command completed for copy ${i + 1}`);
 
-        // Explicit cleanup for large buffers
-        if (pdfBuffer.length > 1024 * 1024) { // If > 1MB
-          // Force garbage collection hint
+        if (pdfBuffer.length > 1024 * 1024) {
           if (global.gc) global.gc();
         }
 
-        // Cleanup
         setTimeout(() => {
           try {
             if (existsSync(pdfFilePath)) {
@@ -270,20 +255,18 @@ export class PrinterService {
           }
         }, 5000);
 
-        // Small delay between copies
-        if (i < copies - 1) {
+        if (i < label.copies - 1) {
           await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
 
       const totalTime = Date.now() - startTime;
-      logger.info(`✅ ULTRA-CONSERVATIVE: ${copies} copies in ${totalTime}ms (${Math.round(totalTime / copies)}ms/copy)`);
+      logger.info(`✅ ULTRA-CONSERVATIVE: ${label.copies} copies in ${totalTime}ms (${Math.round(totalTime / label.copies)}ms/copy)`);
 
     } catch (error: any) {
       logger.error(`❌ Ultra-conservative method failed: ${error.message}`);
       logger.error('Error stack:', error.stack);
 
-      // Log browser and page state for debugging
       try {
         if (this.browser) {
           const pages = await this.browser.pages();
@@ -300,7 +283,6 @@ export class PrinterService {
 
       throw error;
     } finally {
-      // Always close the page with extensive error handling
       if (page) {
         try {
           if (!page.isClosed()) {
@@ -319,18 +301,18 @@ export class PrinterService {
 
 
 
-  private async printWithWkhtmltopdf(html: string, printerName: string, copies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+  private async printWithWkhtmltopdf(html: string, label: PrintLabel, metadata: PrintMetadata): Promise<void> {
     const startTime = Date.now();
 
     logger.info(`=== WKHTMLTOPDF FALLBACK METHOD ===`);
 
     try {
-      for (let i: number = 0; i < copies; i++) {
-        await this.printSingleCopyWithWkhtmltopdf(html, printerName, i + 1, copies, metadata);
+      for (let i: number = 0; i < label.copies; i++) {
+        await this.printSingleCopyWithWkhtmltopdf(html, label, i + 1, metadata);
       }
 
       const wkhtmltopdfTime = Date.now() - startTime;
-      logger.info(`✅ WKHTMLTOPDF FALLBACK: ${copies} copies printed in ${wkhtmltopdfTime}ms (avg: ${Math.round(wkhtmltopdfTime / copies)}ms per copy)`);
+      logger.info(`✅ WKHTMLTOPDF FALLBACK: ${label.copies} copies printed in ${wkhtmltopdfTime}ms (avg: ${Math.round(wkhtmltopdfTime / label.copies)}ms per copy)`);
 
     } catch (error: any) {
       logger.error(`❌ wkhtmltopdf fallback failed: ${error.message}`);
@@ -338,11 +320,10 @@ export class PrinterService {
     }
   }
 
-  private async printSingleCopyWithWkhtmltopdf(html: string, printerName: string, copyNumber: number, totalCopies: number, metadata: Partial<PrintMetadata>): Promise<void> {
+  private async printSingleCopyWithWkhtmltopdf(html: string, label: PrintLabel, copyNumber: number, metadata: PrintMetadata): Promise<void> {
     const startTime = Date.now();
 
     try {
-      // Create temporary HTML file
       const timestamp = Date.now();
       const randomId = Math.random().toString(36).substr(2, 9);
       const tempFile: string = `temp_${timestamp}_${randomId}.html`;
@@ -355,19 +336,19 @@ export class PrinterService {
 
       writeFileSync(htmlFilePath, html, 'utf8');
 
-      // Build wkhtmltopdf command
+      // Build wkhtmltopdf command with label dimensions
       const args = [
-        '--margin-top 0',
-        '--margin-bottom 0',
-        '--margin-left 0',
-        '--margin-right 0',
+        `--margin-top ${label.margin.top}`,
+        `--margin-bottom ${label.margin.bottom}`,
+        `--margin-left ${label.margin.left}`,
+        `--margin-right ${label.margin.right}`,
         '--enable-local-file-access',
-        '--page-width 1in',
-        '--page-height 10in'
+        `--page-width ${label.width}`,
+        `--page-height ${label.height}`
       ];
 
-      if (metadata?.orientation) {
-        args.push('--orientation ' + metadata.orientation);
+      if (label.orientation) {
+        args.push('--orientation ' + label.orientation);
       }
 
       args.push(`"${htmlFilePath}"`, `"${pdfFile}"`);
@@ -375,14 +356,12 @@ export class PrinterService {
       const convertCommand = `"${this.browserService.wkhtmltopdfPath}" ${args.join(' ')}`;
       await execAsync(convertCommand, { timeout: 5000 });
 
-      // Print PDF using PDFtoPrinter.exe
       const binDir = join(process.cwd(), 'bin');
       const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
-      const printCommand = `"${pdfToPrinterPath}" "${pdfFile}" "${printerName}"`;
+      const printCommand = `"${pdfToPrinterPath}" "${pdfFile}" "${label.printerName}"`;
 
       await execAsync(printCommand, { timeout: 5000 });
 
-      // Clean up files
       setTimeout(() => {
         try {
           if (existsSync(htmlFilePath)) {
@@ -397,10 +376,9 @@ export class PrinterService {
       }, 2000);
 
       const duration = Date.now() - startTime;
-      logger.debug(`⚡ wkhtmltopdf copy ${copyNumber}/${totalCopies}: ${duration}ms`);
+      logger.debug(`⚡ wkhtmltopdf copy ${copyNumber}/${label.copies}: ${duration}ms`);
 
-      // Small delay between copies
-      if (copyNumber < totalCopies) {
+      if (copyNumber < label.copies) {
         await new Promise(resolve => setTimeout(resolve, 300));
       }
 
@@ -411,21 +389,25 @@ export class PrinterService {
     }
   }
 
-  private enhanceHtmlForPrinting(html: string): string {
-    // Add print-specific CSS if not already present
+  private enhanceHtmlForPrinting(html: string, label: PrintLabel): string {
     const printCss = `
     <style>
       @media print {
-        body { margin: 0; padding: 0; }
-        @page { margin: 0; size: auto; }
+        body { 
+          margin: ${label.margin.top} ${label.margin.right} ${label.margin.bottom} ${label.margin.left}; 
+          padding: 0; 
+        }
+        @page { 
+          margin: 0; 
+          size: ${label.width} ${label.height}; 
+          ${label.orientation ? `orientation: ${label.orientation};` : ''}
+        }
         * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; }
       }
     </style>
   `;
 
-    // Check if HTML already has print styles
     if (!html.toLowerCase().includes('@media print') && !html.toLowerCase().includes('@page')) {
-      // Insert CSS before closing head tag, or at the beginning if no head tag
       if (html.toLowerCase().includes('</head>')) {
         return html.replace(/<\/head>/i, `${printCss}</head>`);
       } else if (html.toLowerCase().includes('<html>')) {
@@ -539,27 +521,43 @@ export class PrinterService {
   public async testPrint(printerName: string): Promise<boolean> {
     try {
       const testHtml = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <style>
-            @media print {
-              body { margin: 0; padding: 10px; font-family: Arial; }
-              @page { margin: 0; size: auto; }
-            }
-          </style>
-        </head>
-        <body>
-          <h2>Print Test</h2>
-          <p>Printer: ${printerName}</p>
-          <p>Time: ${new Date().toLocaleString()}</p>
-          <p>Status: Print service operational</p>
-        </body>
-        </html>
-      `;
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          @media print {
+            body { margin: 0; padding: 10px; font-family: Arial; }
+            @page { margin: 0; size: auto; }
+          }
+        </style>
+      </head>
+      <body>
+        <h2>Print Test</h2>
+        <p>Printer: ${printerName}</p>
+        <p>Time: ${new Date().toLocaleString()}</p>
+        <p>Status: Print service operational</p>
+      </body>
+      </html>
+    `;
 
-      const base64Html = Buffer.from(testHtml).toString('base64');
-      await this.printLabel(printerName, base64Html, { copies: 1 });
+      const testLabel: PrintLabel = {
+        userId: 12345,
+        name: 'Test Print',
+        htmlContent: Buffer.from(testHtml).toString('base64'),
+        printerName: printerName,
+        printMedia: 'Label',
+        mpGroup: {
+          id: 0,
+          name: 'Adults',
+          print: 'Label'
+        },
+        margin: { top: '0mm', right: '0mm', bottom: '0mm', left: '0mm' },
+        width: '10in',
+        height: '1in',
+        copies: 1
+      };
+
+      await this.printLabel(testLabel, { priority: 'medium' });
       return true;
     } catch (error) {
       logger.error(`Test print failed for ${printerName}:`, error);

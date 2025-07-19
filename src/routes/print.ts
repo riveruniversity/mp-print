@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { PrintService } from '../services/PrintService';
 import { validatePrintRequest } from '../middleware/validation';
 import { PrintRequest, PrintJob, ServerMetrics, PrinterStatus, ApiResponse } from '../types';
+import { FailedLabel, SubmitResponse, PartialSuccessResponse, AllFailedResponse } from '../types';
 
 const router: Router = Router();
 
@@ -25,56 +26,121 @@ const getPrintService = (): PrintService => {
   return printService;
 };
 
-// Enhanced submit endpoint with ultra-optimization awareness
+
+
+
 router.post('/submit', validatePrintRequest, async (req: Request, res: Response): Promise<void> => {
   const startTime = Date.now();
   
   try {
     const service = getPrintService();
+    const { labels, metadata } = req.body;
     
-    const request: PrintRequest = {
-      id: uuidv4(),
-      printerName: req.body.printerName,
-      htmlContent: req.body.htmlContent,
-      metadata: req.body.metadata,
-      timestamp: Date.now(),
-      retryCount: 0
-    };
+    const successfulJobs: string[] = [];
+    const failedLabels: FailedLabel[] = [];
 
-    // Log request details for ultra-optimization monitoring
-    console.log(`🎯 PRINT REQUEST: ${request.metadata.copies} copies to ${request.printerName}`);
+    // Process each label separately
+    for (const label of labels) {
+      try {
+        // Validate printer is available
+        const printer = service.getPrinterStatus().find(p => p.name === label.printerName);
+        if (!printer) {
+          failedLabels.push({
+            userId: label.userId,
+            name: label.name,
+            error: `Printer '${label.printerName}' not found`,
+            printerName: label.printerName
+          });
+          continue;
+        }
 
-    const jobId: string = service.submitPrintJob(request);
-    
+        if (printer.status !== 'online') {
+          failedLabels.push({
+            userId: label.userId,
+            name: label.name,
+            error: `Printer '${label.printerName}' is ${printer.status}`,
+            printerName: label.printerName
+          });
+          continue;
+        }
+
+        // Create individual print request using your updated PrintRequest type
+        const request: PrintRequest = {
+          id: uuidv4(),
+          labels: [label],
+          metadata,
+          timestamp: Date.now(),
+          retryCount: 0
+        };
+
+        const jobId = service.submitPrintJob(request);
+        successfulJobs.push(jobId);
+
+        console.log(`🎯 LABEL SUBMITTED: ${label.copies} copies of "${label.name}" (userId: ${label.userId}) to ${label.printerName}`);
+
+      } catch (error: any) {
+        failedLabels.push({
+          userId: label.userId,
+          name: label.name,
+          error: error.message,
+          printerName: label.printerName
+        });
+      }
+    }
+
     const processingTime = Date.now() - startTime;
-    
-    const response: ApiResponse<{ jobId: string; processingTime: number }> = {
-      success: true,
-      data: { 
-        jobId,
-        processingTime  // Include timing for performance monitoring
-      },
-      message: 'Print job submitted successfully'
-    };
-    
-    res.json(response);
+
+    // Response handling
+    if (successfulJobs.length > 0 && failedLabels.length === 0) {
+      res.json({
+        success: true,
+        data: { 
+          jobIds: successfulJobs,
+          totalLabels: labels.length,
+          processingTime
+        },
+        message: `All ${labels.length} labels submitted successfully`
+      });
+    } else if (successfulJobs.length > 0 && failedLabels.length > 0) {
+      res.status(207).json({
+        success: false,
+        data: {
+          successfulJobs,
+          failedLabels,
+          totalLabels: labels.length,
+          processingTime
+        },
+        message: `${successfulJobs.length}/${labels.length} labels submitted successfully`
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        data: {
+          failedLabels,
+          totalLabels: labels.length,
+          processingTime
+        },
+        error: 'All labels failed validation or printer unavailable'
+      });
+    }
+
   } catch (error: any) {
     const processingTime = Date.now() - startTime;
     console.error(`❌ SUBMIT FAILED in ${processingTime}ms:`, error.message);
     
-    const response: ApiResponse = {
+    res.status(500).json({
       success: false,
       error: error.message
-    };
-    res.status(500).json(response);
+    });
   }
 });
+
 
 router.get('/status/:jobId', (req: Request, res: Response): void => {
   try {
     const service = getPrintService();
     const job: PrintJob | undefined = service.getJobStatus(req.params.jobId);
-    
+
     if (!job) {
       const response: ApiResponse = {
         success: false,
@@ -83,8 +149,8 @@ router.get('/status/:jobId', (req: Request, res: Response): void => {
       res.status(404).json(response);
       return;
     }
-    
-    const response: ApiResponse<{ job: PrintJob }> = {
+
+    const response: ApiResponse<{ job: PrintJob; }> = {
       success: true,
       data: { job }
     };
@@ -103,20 +169,20 @@ router.get('/metrics', (req: Request, res: Response): void => {
   try {
     const service = getPrintService();
     const metrics: ServerMetrics = service.getMetrics();
-    
+
     // Add ultra-optimization performance stats if available
     let ultraStats = {};
     if (typeof service.getPerformanceStats === 'function') {
       ultraStats = service.getPerformanceStats();
     }
-    
-    const response: ApiResponse<{ 
-      metrics: ServerMetrics; 
+
+    const response: ApiResponse<{
+      metrics: ServerMetrics;
       ultraOptimization?: any;
       timestamp: string;
     }> = {
       success: true,
-      data: { 
+      data: {
         metrics,
         ultraOptimization: ultraStats,
         timestamp: new Date().toISOString()
@@ -136,14 +202,14 @@ router.get('/printers', (req: Request, res: Response): void => {
   try {
     const service = getPrintService();
     const printers: PrinterStatus[] = service.getPrinterStatus();
-    
-    const response: ApiResponse<{ 
+
+    const response: ApiResponse<{
       printers: PrinterStatus[];
       totalPrinters: number;
       onlinePrinters: number;
     }> = {
       success: true,
-      data: { 
+      data: {
         printers,
         totalPrinters: printers.length,
         onlinePrinters: printers.filter(p => p.status === 'online').length
@@ -163,18 +229,18 @@ router.get('/printers', (req: Request, res: Response): void => {
 router.get('/browser-status', (req: Request, res: Response): void => {
   try {
     const service = getPrintService();
-    
+
     // Check if the ultra-optimized browser status method exists
-    let browserStatus: { available: boolean; error?: string; stats?: any } = { 
-      available: false, 
-      error: 'Method not available' 
+    let browserStatus: { available: boolean; error?: string; stats?: any; } = {
+      available: false,
+      error: 'Method not available'
     };
-    
+
     if (typeof service.getBrowserStatus === 'function') {
       browserStatus = service.getBrowserStatus();
     }
-    
-    const response: ApiResponse<{ browserStatus: any }> = {
+
+    const response: ApiResponse<{ browserStatus: any; }> = {
       success: true,
       data: { browserStatus }
     };
@@ -191,13 +257,13 @@ router.get('/browser-status', (req: Request, res: Response): void => {
 // Performance test endpoint for ultra-optimization validation
 router.post('/test-performance/:printerName', async (req: Request, res: Response): Promise<void> => {
   const startTime = Date.now();
-  
+
   try {
     const printerName: string = req.params.printerName;
     const copies: number = parseInt(req.body.copies || '3');
-    
+
     const service = getPrintService();
-    
+
     // Check if printer exists and is online
     const printer: PrinterStatus | undefined = service.getPrinterStatus().find(p => p.name === printerName);
     if (!printer) {
@@ -229,19 +295,19 @@ router.post('/test-performance/:printerName', async (req: Request, res: Response
         </style>
       </head>
       <body>
-        <div>⚡ ULTRA-OPTIMIZATION TEST - ${copies} copies - ${new Date().toLocaleString()}</div>
+        <div>⚡ PRINT TEST - ${copies} copies - ${new Date().toLocaleString()}</div>
       </body>
       </html>
     `;
 
     const base64Html = Buffer.from(testHtml).toString('base64');
-    
+
     const request: PrintRequest = {
       id: uuidv4(),
-      printerName,
-      htmlContent: base64Html,
+      labels: [
+        
+      ],
       metadata: {
-        ageGroup: 'test',
         priority: 'high',
         copies
       },
@@ -250,21 +316,21 @@ router.post('/test-performance/:printerName', async (req: Request, res: Response
     };
 
     console.log(`🧪 PERFORMANCE TEST: ${copies} copies to ${printerName}`);
-    
+
     const jobId: string = service.submitPrintJob(request);
     const totalTime = Date.now() - startTime;
-    
-    const response: ApiResponse<{ 
+
+    const response: ApiResponse<{
       jobId: string;
       testResults: {
         copies: number;
         totalTimeMs: number;
         averagePerCopyMs: number;
         expectedUltraOptimized: boolean;
-      }
+      };
     }> = {
       success: true,
-      data: { 
+      data: {
         jobId,
         testResults: {
           copies,
@@ -275,12 +341,12 @@ router.post('/test-performance/:printerName', async (req: Request, res: Response
       },
       message: `Performance test submitted: ${copies} copies in ${totalTime}ms`
     };
-    
+
     res.json(response);
   } catch (error: any) {
     const totalTime = Date.now() - startTime;
     console.error(`❌ PERFORMANCE TEST FAILED in ${totalTime}ms:`, error.message);
-    
+
     const response: ApiResponse = {
       success: false,
       error: error.message
@@ -294,7 +360,7 @@ router.post('/zebra/reset-media/:printerName', async (req: Request, res: Respons
   try {
     const printerName: string = req.params.printerName;
     const service = getPrintService();
-    
+
     // Check if printer exists and is online
     const printer: PrinterStatus | undefined = service.getPrinterStatus().find(p => p.name === printerName);
     if (!printer) {
@@ -316,12 +382,12 @@ router.post('/zebra/reset-media/:printerName', async (req: Request, res: Respons
     }
 
     console.log(`🔧 ZEBRA RESET: ${printerName}`);
-    
+
     // Send ZPL commands to reset media values
     const success: boolean = await service.resetZebraMediaValues(printerName);
-    
+
     if (success) {
-      const response: ApiResponse<{ message: string }> = {
+      const response: ApiResponse<{ message: string; }> = {
         success: true,
         data: { message: 'Media values reset successfully' },
         message: 'Zebra printer media values have been reset'

@@ -52,9 +52,10 @@ export class BrowserService {
         args: [
           '--headless=new',
           '--disable-setuid-sandbox',
+          '--disable-javascript',
           '--disable-dev-shm-usage',
-          '--disable-gpu',
           '--disable-web-security',
+          '--disable-gpu',
           '--disable-features=VizDisplayCompositor',
           '--disable-features=TranslateUI',
           '--disable-background-timer-throttling',
@@ -71,7 +72,6 @@ export class BrowserService {
           '--mute-audio',
           '--no-first-run',
           '--disable-ipc-flooding-protection',
-          '--disable-javascript',
           // Memory optimizations
           '--memory-pressure-off',
         ],

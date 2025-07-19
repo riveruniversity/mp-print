@@ -7,6 +7,8 @@ export interface PrintRequest {
 }
 
 export interface PrintLabel {
+  userId: number;
+  name: string;
   htmlContent: string; // base64 encoded HTML
   printerName: string;
   printMedia: PrintMedia;
@@ -14,6 +16,7 @@ export interface PrintLabel {
   margin: { top: string, right: string, bottom: string, left: string; },
   width: string;
   height: string;
+  copies: number;
   orientation?: PrintOrientation;
 }
 
@@ -142,4 +145,30 @@ export interface HealthCheckResponse {
   timestamp: string;
   uptime: number;
   memory: NodeJS.MemoryUsage;
+}
+
+export interface FailedLabel {
+  userId: string;
+  name: string;
+  error: string;
+  printerName: string;
+}
+
+export interface SubmitResponse {
+  jobIds: string[];
+  totalLabels: number;
+  processingTime: number;
+}
+
+export interface PartialSuccessResponse {
+  successfulJobs: string[];
+  failedLabels: FailedLabel[];
+  totalLabels: number;
+  processingTime: number;
+}
+
+export interface AllFailedResponse {
+  failedLabels: FailedLabel[];
+  totalLabels: number;
+  processingTime: number;
 }

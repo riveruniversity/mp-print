@@ -9,7 +9,7 @@ import logger from '../utils/logger';
 export class PrintService {
   private static instance: PrintService;
   private static isInitialized: boolean = false;
-  
+
   private printerService: PrinterService;
   private queueService: QueueService;
   private processingInterval?: ReturnType<typeof setInterval>;
@@ -56,7 +56,7 @@ export class PrintService {
       await this.printerService.initialize();
       this.startProcessing();
       this.startMetricsCollection();
-      
+
       PrintService.isInitialized = true;
       logger.info('✅ PrintService singleton initialized successfully with ultra-optimization support');
     } catch (error) {
@@ -103,51 +103,45 @@ export class PrintService {
   }
 
   private async processJob(job: PrintJob): Promise<void> {
-    const { request }: { request: PrintRequest; } = job;
+    const { request } = job;
     const startTime: number = Date.now();
 
     try {
-      if (!this.printerService.isOnline(request.printerName)) {
-        throw new Error(`Printer ${request.printerName} is not available`);
+      const label = request.labels[0];
+
+      if (!this.printerService.isOnline(label.printerName)) {
+        throw new Error(`Printer ${label.printerName} is not available`);
       }
 
-      this.printerService.updateJobCount(request.printerName, 1);
+      this.printerService.updateJobCount(label.printerName, 1);
 
-      // Log ultra-optimization attempt
-      const copies = request.metadata.copies || 1;
-      logger.debug(`🚀 Processing ultra-optimized job: ${copies} copies to ${request.printerName}`);
+      logger.debug(`🚀 Processing label: ${label.copies} copies of "${label.name}" (userId: ${label.userId}) to ${label.printerName}`);
 
-      await this.printerService.printLabel(
-        request.printerName,
-        request.htmlContent,
-        request.metadata
-      );
+      await this.printerService.printLabel(label, request.metadata);
 
       this.queueService.completeJob(job.id, true);
       const processingTime: number = Date.now() - startTime;
-      
-      // Update both regular and ultra-optimization metrics
-      this.updateProcessingTime(processingTime);
-      this.updateUltraOptimizationMetrics(processingTime, copies);
 
-      // Log performance achievement
-      const avgTimePerCopy = processingTime / copies;
+      this.updateProcessingTime(processingTime);
+      this.updateUltraOptimizationMetrics(processingTime, label.copies);
+
+      const avgTimePerCopy = processingTime / label.copies;
       if (avgTimePerCopy < 100) {
-        logger.info(`⚡ ULTRA-FAST: ${copies} copies in ${processingTime}ms (${avgTimePerCopy.toFixed(0)}ms/copy)`);
+        logger.info(`⚡ ULTRA-FAST: ${label.copies} copies of "${label.name}" (userId: ${label.userId}) in ${processingTime}ms (${avgTimePerCopy.toFixed(0)}ms/copy)`);
       }
 
     } catch (error: any) {
       logger.error(`Job ${job.id} failed:`, error);
       this.queueService.completeJob(job.id, false, error.message);
-      
-      // Track fallback usage
+
       if (error.message?.includes('PUPPETEER FAILED')) {
         this.ultraOptimizationMetrics.puppeteerFallbackCount++;
       } else if (error.message?.includes('wkhtmltopdf')) {
         this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount++;
       }
     } finally {
-      this.printerService.updateJobCount(request.printerName, -1);
+      const label = request.labels[0];
+      this.printerService.updateJobCount(label.printerName, -1);
     }
   }
 
@@ -165,17 +159,17 @@ export class PrintService {
 
   private updateUltraOptimizationMetrics(processingTime: number, copies: number): void {
     this.ultraOptimizationMetrics.totalUltraOptimizedJobs++;
-    
+
     const currentAvg = this.ultraOptimizationMetrics.averageUltraOptimizedTime;
     const currentCount = this.ultraOptimizationMetrics.totalUltraOptimizedJobs;
-    
+
     if (currentCount === 1) {
       this.ultraOptimizationMetrics.averageUltraOptimizedTime = processingTime;
     } else {
       this.ultraOptimizationMetrics.averageUltraOptimizedTime =
         (currentAvg * (currentCount - 1) + processingTime) / currentCount;
     }
-    
+
     this.ultraOptimizationMetrics.lastOptimizationCheck = Date.now();
   }
 
@@ -193,11 +187,11 @@ export class PrintService {
 
   public submitPrintJob(request: PrintRequest): string {
     this.metrics.totalJobs++;
-    
+
     // Log submission with ultra-optimization context
     const copies = request.metadata.copies || 1;
-    logger.debug(`📋 Job submitted: ${copies} copies to ${request.printerName} (Priority: ${request.metadata.priority})`);
-    
+    logger.debug(`📋 Job submitted: ${copies} copies to ${request.id} (Priority: ${request.metadata.priority})`);
+
     return this.queueService.addJob(request);
   }
 
@@ -214,7 +208,7 @@ export class PrintService {
   }
 
 
-  public getBrowserStatus(): { available: boolean, error?: string, stats?: any } {
+  public getBrowserStatus(): { available: boolean, error?: string, stats?: any; } {
     if (typeof this.printerService.getBrowserStatus === 'function') {
       return this.printerService.getBrowserStatus();
     }
@@ -223,20 +217,20 @@ export class PrintService {
 
   public getPerformanceStats(): any {
     const browserStatus = this.getBrowserStatus();
-    
+
     return {
       // Browser and Puppeteer stats
       browser: browserStatus,
-      
+
       // Ultra-optimization metrics
       ultraOptimization: {
         ...this.ultraOptimizationMetrics,
         averageTimePerJob: this.ultraOptimizationMetrics.averageUltraOptimizedTime,
-        optimizationSuccessRate: this.ultraOptimizationMetrics.totalUltraOptimizedJobs > 0 
+        optimizationSuccessRate: this.ultraOptimizationMetrics.totalUltraOptimizedJobs > 0
           ? ((this.ultraOptimizationMetrics.totalUltraOptimizedJobs - this.ultraOptimizationMetrics.puppeteerFallbackCount - this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount) / this.ultraOptimizationMetrics.totalUltraOptimizedJobs * 100).toFixed(1) + '%'
           : '0%'
       },
-      
+
       // System performance
       system: {
         uptime: process.uptime(),
@@ -244,10 +238,10 @@ export class PrintService {
         activeTimers: this.getActiveHandlesCount(),
         timestamp: new Date().toISOString()
       },
-      
+
       // Queue performance
       queue: this.queueService.getQueueStatus(),
-      
+
       // Printer performance  
       printers: {
         total: this.printerService.getAllPrinters().length,
@@ -260,7 +254,7 @@ export class PrintService {
   public getUltraOptimizationReport(): any {
     const stats = this.getPerformanceStats();
     const avgTime = this.ultraOptimizationMetrics.averageUltraOptimizedTime;
-    
+
     return {
       status: avgTime < 500 ? 'EXCELLENT' : avgTime < 1000 ? 'GOOD' : avgTime < 2000 ? 'NEEDS_IMPROVEMENT' : 'POOR',
       performance: {
@@ -280,29 +274,29 @@ export class PrintService {
 
   private generateOptimizationRecommendations(avgTime: number): string[] {
     const recommendations: string[] = [];
-    
+
     if (avgTime > 1000) {
       recommendations.push('Consider reducing concurrent jobs in config');
       recommendations.push('Check if browser is experiencing memory pressure');
     }
-    
+
     if (this.ultraOptimizationMetrics.puppeteerFallbackCount > 0) {
       recommendations.push('Monitor Puppeteer stability - fallbacks detected');
     }
-    
+
     if (this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount > 0) {
       recommendations.push('wkhtmltopdf fallbacks detected - check Puppeteer configuration');
     }
-    
+
     const browserStatus = this.getBrowserStatus();
     if (!browserStatus.available) {
       recommendations.push('Browser not available - check Puppeteer initialization');
     }
-    
+
     if (recommendations.length === 0) {
       recommendations.push('Ultra-optimization performing excellently!');
     }
-    
+
     return recommendations;
   }
 
@@ -324,20 +318,20 @@ export class PrintService {
   public async testPrint(printerName: string, copies: number = 1): Promise<boolean> {
     if (typeof this.printerService.testPrint === 'function') {
       const startTime = Date.now();
-      
+
       try {
         const result = await this.printerService.testPrint(printerName);
         const duration = Date.now() - startTime;
-        
+
         logger.info(`🧪 Test print completed in ${duration}ms (Expected: <500ms for ultra-optimization)`);
-        
+
         return result;
       } catch (error) {
         logger.error('Test print failed:', error);
         return false;
       }
     }
-    
+
     logger.warn('testPrint method not available on PrinterService');
     return false;
   }
@@ -354,10 +348,10 @@ export class PrintService {
       clearInterval(this.metricsInterval);
     }
     this.printerService.destroy();
-    
+
     // Reset singleton state
     PrintService.isInitialized = false;
-    
+
     logger.info('🧹 PrintService singleton destroyed and reset');
   }
 }
