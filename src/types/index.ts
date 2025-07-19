@@ -1,20 +1,37 @@
 export interface PrintRequest {
   id: string;
-  printerName: string;
-  htmlContent: string; // base64 encoded HTML
+  labels: PrintLabel[];
   metadata: PrintMetadata;
   timestamp: number;
   retryCount: number;
 }
 
-export interface PrintMetadata {
-  ageGroup: string;
-  priority: PrintPriority;
-  copies: number;
-  paperSize?: string;
+export interface PrintLabel {
+  htmlContent: string; // base64 encoded HTML
+  printerName: string;
+  printMedia: PrintMedia;
+  mpGroup: MPGroup;
+  margin: { top: string, right: string, bottom: string, left: string; },
+  width: string;
+  height: string;
   orientation?: PrintOrientation;
 }
 
+export interface PrintMetadata {
+  priority?: PrintPriority;
+  copies?: number;
+  paperSize?: string;
+}
+
+
+interface MPGroup {
+  id: number;
+  name: 'Minors' | 'Adults' | 'Youth' | 'Kids' | 'Bears' | 'Nursery';
+  print: 'Label' | 'Wristband';
+}
+
+
+export type PrintMedia = 'Wristband' | 'Label';
 export type PrintPriority = 'low' | 'medium' | 'high';
 export type PrintOrientation = 'portrait' | 'landscape';
 export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
