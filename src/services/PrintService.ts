@@ -213,7 +213,7 @@ export class PrintService {
     return this.printerService.getAllPrinters();
   }
 
-  // NEW: Ultra-optimization specific methods
+
   public getBrowserStatus(): { available: boolean, error?: string, stats?: any } {
     if (typeof this.printerService.getBrowserStatus === 'function') {
       return this.printerService.getBrowserStatus();
