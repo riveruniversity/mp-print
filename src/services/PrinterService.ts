@@ -37,8 +37,8 @@ export class PrinterService {
     try {
       const command: string = `powershell -Command "Get-Printer | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
 
-      // Add timeout to prevent hanging
-      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 5000 });
+      // Increase timeout for initial discovery - PowerShell startup is slow
+      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 15000 });
 
       if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
         logger.warn('No printers discovered');
@@ -57,7 +57,7 @@ export class PrinterService {
           jobsInQueue: 0,
           errorCount: 0
         });
-        
+
         // Initialize error tracking
         this.printerErrorCounts.set(printer.Name, 0);
         this.printerLastError.set(printer.Name, 0);
@@ -82,52 +82,110 @@ export class PrinterService {
 
   private startHealthCheck(): void {
     this.healthCheckInterval = setInterval(async (): Promise<void> => {
-      await this.checkPrinterHealth();
+      // Use a simpler, faster health check method
+      await this.checkPrinterHealthFast();
     }, config.printing.printerHealthCheckInterval);
   }
 
-  private async checkPrinterHealth(): Promise<void> {
-    // Process all printer health checks in parallel with timeouts
-    const healthCheckPromises = Array.from(this.printers.entries()).map(async ([printerName, status]) => {
-      try {
-        const command: string = `powershell -Command "Get-Printer -Name '${printerName}' | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
-        
-        // Add timeout to prevent hanging on individual printer checks
-        const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 3000 });
+  // Faster health check that doesn't query each printer individually
+  private async checkPrinterHealthFast(): Promise<void> {
+    try {
+      // Get all printer statuses in one command instead of individual queries
+      const command: string = `powershell -Command "Get-Printer | Select-Object PrinterStatus, Name | ConvertTo-Json -Compress"`;
 
-        if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
-          logger.warn(`No printer data returned for ${printerName}`);
-          status.status = 'offline';
-          status.errorCount++;
-          return;
-        }
-        
-        const result: { PrinterStatus: number, Name: string, DriverName: string, PortName: string; } = JSON.parse(stdout);
-        const newStatus: PrinterStatusType = this.mapPrinterStatus(result.PrinterStatus);
-        
-        if (newStatus !== status.status) {
-          logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
-          status.status = newStatus;
-          
-          // Reset error count if printer comes back online
-          if (newStatus === 'online') {
-            this.printerErrorCounts.set(printerName, 0);
+      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 10000 });
+
+      if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
+        logger.warn('No printer data returned during health check');
+        return;
+      }
+
+      const result: any[] | any = JSON.parse(stdout);
+      const printerArray: any[] = Array.isArray(result) ? result : [result];
+
+      // Update status for all known printers
+      for (const [printerName, status] of this.printers) {
+        const foundPrinter = printerArray.find(p => p.Name === printerName);
+
+        if (foundPrinter) {
+          const newStatus: PrinterStatusType = this.mapPrinterStatus(foundPrinter.PrinterStatus);
+
+          if (newStatus !== status.status) {
+            logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
+            status.status = newStatus;
+
+            // Reset error count if printer comes back online
+            if (newStatus === 'online') {
+              this.printerErrorCounts.set(printerName, 0);
+            }
+          }
+        } else {
+          // Printer not found in system, mark as offline
+          if (status.status !== 'offline') {
+            logger.warn(`Printer ${printerName} not found in system, marking as offline`);
+            status.status = 'offline';
+            status.errorCount++;
           }
         }
-      } catch (error: any) {
-        logger.warn(`Health check failed for printer ${printerName}:`, error);
-        status.status = 'error';
-        status.errorCount++;
-        
-        // Track printer-specific errors
-        const currentErrors = this.printerErrorCounts.get(printerName) || 0;
-        this.printerErrorCounts.set(printerName, currentErrors + 1);
-        this.printerLastError.set(printerName, Date.now());
       }
-    });
 
-    // Wait for all health checks to complete, but don't let one failure block others
-    await Promise.allSettled(healthCheckPromises);
+    } catch (error: any) {
+      logger.warn(`Fast health check failed, falling back to individual checks:`, error.message);
+      // Fallback to individual checks if bulk command fails
+      await this.checkPrinterHealthIndividual();
+    }
+  }
+
+  // Fallback method for individual printer checks (batched)
+  private async checkPrinterHealthIndividual(): Promise<void> {
+    // Process printer health checks in smaller batches to avoid overwhelming PowerShell
+    const printerEntries = Array.from(this.printers.entries());
+    const batchSize = 5; // Process only 5 printers at a time
+
+    for (let i = 0; i < printerEntries.length; i += batchSize) {
+      const batch = printerEntries.slice(i, i + batchSize);
+
+      const healthCheckPromises = batch.map(async ([printerName, status]) => {
+        try {
+          const command: string = `powershell -Command "Get-Printer -Name '${printerName}' | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
+
+          // Increase timeout for PowerShell commands - they're slow on Windows
+          const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 10000 });
+
+          if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
+            logger.warn(`No printer data returned for ${printerName}`);
+            status.status = 'offline';
+            status.errorCount++;
+            return;
+          }
+
+          const result: { PrinterStatus: number, Name: string, DriverName: string, PortName: string; } = JSON.parse(stdout);
+          const newStatus: PrinterStatusType = this.mapPrinterStatus(result.PrinterStatus);
+
+          if (newStatus !== status.status) {
+            logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
+            status.status = newStatus;
+
+            // Reset error count if printer comes back online
+            if (newStatus === 'online') {
+              this.printerErrorCounts.set(printerName, 0);
+            }
+          }
+        } catch (error: any) {
+          logger.warn(`Health check failed for printer ${printerName}:`, error);
+          status.status = 'error';
+          status.errorCount++;
+
+          // Track printer-specific errors
+          const currentErrors = this.printerErrorCounts.get(printerName) || 0;
+          this.printerErrorCounts.set(printerName, currentErrors + 1);
+          this.printerLastError.set(printerName, Date.now());
+        }
+      });
+
+      // Wait for all health checks to complete, but don't let one failure block others
+      await Promise.allSettled(healthCheckPromises);
+    }
   }
 
   public getPrinterStatus(printerName: string): PrinterStatus | undefined {
@@ -147,21 +205,23 @@ export class PrinterService {
 
   public isOnline(printerName: string): boolean {
     const printer: PrinterStatus | undefined = this.printers.get(printerName);
-    if (!printer || printer.status !== 'online') {
-      return false;
+    if (!printer) {
+      return false; // Unknown printer
     }
-    
-    // Check if printer has had too many recent errors
+
+    // For high-volume printing, be more permissive
+    // Only reject if printer is definitely known to be problematic
     const errorCount = this.printerErrorCounts.get(printerName) || 0;
     const lastError = this.printerLastError.get(printerName) || 0;
     const timeSinceLastError = Date.now() - lastError;
-    
-    // If printer has had more than 3 errors in the last 5 minutes, consider it unstable
-    if (errorCount > 3 && timeSinceLastError < 300000) {
-      logger.warn(`Printer ${printerName} considered unstable due to recent errors`);
+
+    // Only block if printer has had more than 10 recent errors in last 10 minutes
+    if (errorCount > 10 && timeSinceLastError < 600000) {
+      logger.warn(`Printer ${printerName} blocked due to recent errors (${errorCount} errors)`);
       return false;
     }
-    
+
+    // Otherwise, assume printer is available for high-throughput printing
     return true;
   }
 
@@ -212,7 +272,7 @@ export class PrinterService {
       const currentErrors = this.printerErrorCounts.get(label.printerName) || 0;
       this.printerErrorCounts.set(label.printerName, currentErrors + 1);
       this.printerLastError.set(label.printerName, Date.now());
-      
+
       logger.error(`Print failed for label "${label.name}" on printer ${label.printerName}:`, error);
       throw error;
     }
@@ -261,7 +321,7 @@ export class PrinterService {
       const copyPromises = Array.from({ length: label.copies }, async (_, i) => {
         const copyNumber = i + 1;
         const copyStartTime = Date.now();
-        
+
         try {
           logger.debug(`Generating PDF for copy ${copyNumber}/${label.copies}...`);
 
@@ -309,7 +369,7 @@ export class PrinterService {
         } catch (error: any) {
           const copyTime = Date.now() - copyStartTime;
           logger.error(`❌ Copy ${copyNumber} failed after ${copyTime}ms:`, error.message);
-          
+
           // Don't throw here - let other copies continue
           return { copyNumber, success: false, time: copyTime, error: error.message };
         }
@@ -317,25 +377,25 @@ export class PrinterService {
 
       // Wait for all copies to complete
       const results = await Promise.allSettled(copyPromises);
-      
+
       // Process results
-      const successful = results.filter((result, i) => 
+      const successful = results.filter((result, i) =>
         result.status === 'fulfilled' && result.value.success
       );
-      
-      const failed = results.filter((result, i) => 
-        result.status === 'rejected' || 
+
+      const failed = results.filter((result, i) =>
+        result.status === 'rejected' ||
         (result.status === 'fulfilled' && !result.value.success)
       );
 
       const totalTime = Date.now() - startTime;
-      
+
       if (successful.length === label.copies) {
         logger.info(`✅ PARALLEL SUCCESS: ${label.copies} copies in ${totalTime}ms (${Math.round(totalTime / label.copies)}ms/copy avg)`);
       } else if (successful.length > 0) {
         logger.warn(`⚠️ PARTIAL SUCCESS: ${successful.length}/${label.copies} copies completed in ${totalTime}ms`);
         logger.warn(`Failed copies: ${failed.length}`);
-        
+
         // If more than half failed, throw error
         if (failed.length > successful.length) {
           throw new Error(`Print job mostly failed: ${failed.length}/${label.copies} copies failed`);
