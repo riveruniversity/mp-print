@@ -1,0 +1,8 @@
+powershell# Navigate to your print server directory
+cd C:\PrintServer
+
+# Update the XML file to use Local System properly (using the correct filename for print server)
+(Get-Content "dist\daemon\printserver.xml") -replace '<user>LocalSystem</user>', '<user></user>' -replace '<password></password>', '<password></password>' | Set-Content "dist\daemon\printserver.xml"
+
+# Now try installing the service
+.\dist\daemon\printserver.exe install

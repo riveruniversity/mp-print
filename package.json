@@ -1,7 +1,7 @@
 {
-  "name": "high-performance-print-server",
+  "name": "mp-print-server",
   "version": "1.0.0",
-  "description": "High-performance print server for label printing",
+  "description": "High-performance print server for mp label printing",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
