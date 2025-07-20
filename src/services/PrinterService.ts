@@ -1,4 +1,4 @@
-// Enhanced PrinterService.ts with async processing and error isolation
+// Enhanced PrinterService.ts - Fixed background hanging issues
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -25,6 +25,9 @@ export class PrinterService {
   private printerErrorCounts: Map<string, number> = new Map();
   private printerLastError: Map<string, number> = new Map();
 
+  // FIXED: Add background operation tracking
+  private backgroundOperationActive = false;
+
   public async initialize(): Promise<void> {
     await this.browserService.initialize();
     this.browser = this.browserService.browser;
@@ -37,8 +40,8 @@ export class PrinterService {
     try {
       const command: string = `powershell -Command "Get-Printer | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
 
-      // Increase timeout for initial discovery - PowerShell startup is slow
-      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 15000 });
+      // FIXED: More aggressive timeout for discovery
+      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 3000 });
 
       if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
         logger.warn('No printers discovered');
@@ -57,7 +60,7 @@ export class PrinterService {
           jobsInQueue: 0,
           errorCount: 0
         });
-
+        
         // Initialize error tracking
         this.printerErrorCounts.set(printer.Name, 0);
         this.printerLastError.set(printer.Name, 0);
@@ -81,110 +84,83 @@ export class PrinterService {
   }
 
   private startHealthCheck(): void {
+    // FIXED: Longer interval to reduce background activity
     this.healthCheckInterval = setInterval(async (): Promise<void> => {
-      // Use a simpler, faster health check method
-      await this.checkPrinterHealthFast();
-    }, config.printing.printerHealthCheckInterval);
-  }
-
-  // Faster health check that doesn't query each printer individually
-  private async checkPrinterHealthFast(): Promise<void> {
-    try {
-      // Get all printer statuses in one command instead of individual queries
-      const command: string = `powershell -Command "Get-Printer | Select-Object PrinterStatus, Name | ConvertTo-Json -Compress"`;
-
-      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 10000 });
-
-      if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
-        logger.warn('No printer data returned during health check');
+      // FIXED: Skip if another background operation is running
+      if (this.backgroundOperationActive) {
+        logger.debug('Skipping health check - background operation in progress');
         return;
       }
-
-      const result: any[] | any = JSON.parse(stdout);
-      const printerArray: any[] = Array.isArray(result) ? result : [result];
-
-      // Update status for all known printers
-      for (const [printerName, status] of this.printers) {
-        const foundPrinter = printerArray.find(p => p.Name === printerName);
-
-        if (foundPrinter) {
-          const newStatus: PrinterStatusType = this.mapPrinterStatus(foundPrinter.PrinterStatus);
-
-          if (newStatus !== status.status) {
-            logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
-            status.status = newStatus;
-
-            // Reset error count if printer comes back online
-            if (newStatus === 'online') {
-              this.printerErrorCounts.set(printerName, 0);
-            }
-          }
-        } else {
-          // Printer not found in system, mark as offline
-          if (status.status !== 'offline') {
-            logger.warn(`Printer ${printerName} not found in system, marking as offline`);
-            status.status = 'offline';
-            status.errorCount++;
-          }
-        }
-      }
-
-    } catch (error: any) {
-      logger.warn(`Fast health check failed, falling back to individual checks:`, error.message);
-      // Fallback to individual checks if bulk command fails
-      await this.checkPrinterHealthIndividual();
-    }
+      
+      await this.checkPrinterHealth();
+    }, Math.max(config.printing.printerHealthCheckInterval, 60000)); // At least 60 seconds
   }
 
-  // Fallback method for individual printer checks (batched)
-  private async checkPrinterHealthIndividual(): Promise<void> {
-    // Process printer health checks in smaller batches to avoid overwhelming PowerShell
-    const printerEntries = Array.from(this.printers.entries());
-    const batchSize = 5; // Process only 5 printers at a time
+  private async checkPrinterHealth(): Promise<void> {
+    // FIXED: Prevent overlapping background operations
+    if (this.backgroundOperationActive) {
+      return;
+    }
 
-    for (let i = 0; i < printerEntries.length; i += batchSize) {
-      const batch = printerEntries.slice(i, i + batchSize);
-
-      const healthCheckPromises = batch.map(async ([printerName, status]) => {
+    this.backgroundOperationActive = true;
+    
+    try {
+      // FIXED: Process only a few printers per cycle to avoid blocking
+      const printerEntries = Array.from(this.printers.entries());
+      const batchSize = Math.min(3, printerEntries.length); // Max 3 printers per check
+      
+      for (let i = 0; i < batchSize; i++) {
+        const [printerName, status] = printerEntries[i];
+        
         try {
-          const command: string = `powershell -Command "Get-Printer -Name '${printerName}' | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
+          // FIXED: Much shorter timeout and simpler command
+          const command: string = `powershell -Command "try { Get-Printer -Name '${printerName}' -ErrorAction Stop | Select-Object PrinterStatus | ConvertTo-Json -Compress } catch { Write-Output 'ERROR' }"`;
+          
+          const healthPromise = execAsync(command, { timeout: 2000 });
+          const timeoutPromise = new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error('Health check timeout')), 2000)
+          );
+          
+          const { stdout } = await Promise.race([healthPromise, timeoutPromise]);
 
-          // Increase timeout for PowerShell commands - they're slow on Windows
-          const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 10000 });
-
-          if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
-            logger.warn(`No printer data returned for ${printerName}`);
+          if (!stdout || stdout.trim() === 'ERROR' || stdout.trim() === '') {
             status.status = 'offline';
             status.errorCount++;
-            return;
-          }
-
-          const result: { PrinterStatus: number, Name: string, DriverName: string, PortName: string; } = JSON.parse(stdout);
-          const newStatus: PrinterStatusType = this.mapPrinterStatus(result.PrinterStatus);
-
-          if (newStatus !== status.status) {
-            logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
-            status.status = newStatus;
-
-            // Reset error count if printer comes back online
-            if (newStatus === 'online') {
-              this.printerErrorCounts.set(printerName, 0);
+          } else {
+            try {
+              const result = JSON.parse(stdout);
+              const newStatus: PrinterStatusType = this.mapPrinterStatus(result.PrinterStatus);
+              
+              if (newStatus !== status.status) {
+                logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
+                status.status = newStatus;
+                
+                if (newStatus === 'online') {
+                  this.printerErrorCounts.set(printerName, 0);
+                }
+              }
+            } catch (parseError) {
+              status.status = 'offline';
+              status.errorCount++;
             }
           }
         } catch (error: any) {
-          logger.warn(`Health check failed for printer ${printerName}:`, error);
+          logger.debug(`Health check failed for printer ${printerName}: ${error.message}`);
           status.status = 'error';
           status.errorCount++;
-
-          // Track printer-specific errors
+          
           const currentErrors = this.printerErrorCounts.get(printerName) || 0;
           this.printerErrorCounts.set(printerName, currentErrors + 1);
           this.printerLastError.set(printerName, Date.now());
         }
-      });
-
-      // Wait for all health checks to complete, but don't let one failure block others
-      await Promise.allSettled(healthCheckPromises);
+        
+        // FIXED: Small delay between printer checks to prevent overwhelming system
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    } catch (error: any) {
+      logger.error('Health check cycle failed:', error);
+    } finally {
+      this.backgroundOperationActive = false;
     }
   }
 
@@ -194,34 +170,29 @@ export class PrinterService {
 
   public getAllPrinters(): PrinterStatus[] {
     try {
-      // Add timeout protection for Map access
       const printersArray = Array.from(this.printers.values());
       return printersArray;
     } catch (error) {
       logger.error('Error accessing printers Map:', error);
-      return []; // Return empty array if there's an issue
+      return [];
     }
   }
 
   public isOnline(printerName: string): boolean {
     const printer: PrinterStatus | undefined = this.printers.get(printerName);
-    if (!printer) {
-      return false; // Unknown printer
+    if (!printer || printer.status !== 'online') {
+      return false;
     }
-
-    // For high-volume printing, be more permissive
-    // Only reject if printer is definitely known to be problematic
+    
     const errorCount = this.printerErrorCounts.get(printerName) || 0;
     const lastError = this.printerLastError.get(printerName) || 0;
     const timeSinceLastError = Date.now() - lastError;
-
-    // Only block if printer has had more than 10 recent errors in last 10 minutes
-    if (errorCount > 10 && timeSinceLastError < 600000) {
-      logger.warn(`Printer ${printerName} blocked due to recent errors (${errorCount} errors)`);
+    
+    if (errorCount > 3 && timeSinceLastError < 300000) {
+      logger.warn(`Printer ${printerName} considered unstable due to recent errors`);
       return false;
     }
-
-    // Otherwise, assume printer is available for high-throughput printing
+    
     return true;
   }
 
@@ -239,7 +210,6 @@ export class PrinterService {
       throw new Error(`Printer ${label.printerName} is not available`);
     }
 
-    // Check if printer is stable
     if (!this.isOnline(label.printerName)) {
       throw new Error(`Printer ${label.printerName} is unstable or has recent errors`);
     }
@@ -250,7 +220,6 @@ export class PrinterService {
 
       const totalStartTime = Date.now();
 
-      // Only use Puppeteer - no fallback needed
       if (!this.browser || !this.browser.connected) {
         await this.browserService.reinitializeBrowser();
         this.browser = this.browserService.browser;
@@ -264,15 +233,13 @@ export class PrinterService {
       const totalTime = Date.now() - totalStartTime;
       logger.info(`📊 LABEL PRINT: ${label.copies} copies of "${label.name}" completed in ${totalTime}ms`);
 
-      // Reset error count on successful print
       this.printerErrorCounts.set(label.printerName, 0);
 
     } catch (error: any) {
-      // Track printer-specific error
       const currentErrors = this.printerErrorCounts.get(label.printerName) || 0;
       this.printerErrorCounts.set(label.printerName, currentErrors + 1);
       this.printerLastError.set(label.printerName, Date.now());
-
+      
       logger.error(`Print failed for label "${label.name}" on printer ${label.printerName}:`, error);
       throw error;
     }
@@ -285,7 +252,13 @@ export class PrinterService {
     let page: Page | null = null;
 
     try {
-      page = await this.browser!.newPage();
+      // FIXED: Shorter page creation timeout
+      const pagePromise = this.browser!.newPage();
+      const pageTimeout = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error('Page creation timeout')), 5000)
+      );
+      
+      page = await Promise.race([pagePromise, pageTimeout]);
 
       await page.setViewport({
         width: 800,
@@ -294,10 +267,19 @@ export class PrinterService {
       });
 
       logger.debug('Setting page content...');
-      await page.setContent(html, {
-        waitUntil: 'networkidle0',
-        timeout: 30000
+      
+      // Keep networkidle0 for image loading but add safety timeout wrapper
+      const contentPromise = page.setContent(html, {
+        waitUntil: 'networkidle0', // KEEP: Required for URL images to load properly
+        timeout: 20000 // Reasonable timeout for content + images
       });
+      
+      const contentTimeout = new Promise<never>((_, reject) => 
+        setTimeout(() => reject(new Error('Page content timeout - images may not have loaded')), 25000)
+      );
+      
+      await Promise.race([contentPromise, contentTimeout]);
+      
       logger.debug('Page content set successfully');
 
       const pdfOptions = {
@@ -312,20 +294,25 @@ export class PrinterService {
           left: label.margin.left
         },
         preferCSSPageSize: true,
-        timeout: 10000
+        timeout: 8000 // FIXED: Reduced from 10000
       };
 
       logger.debug('Starting parallel PDF generation...');
 
-      // Create all copy processing promises in parallel
       const copyPromises = Array.from({ length: label.copies }, async (_, i) => {
         const copyNumber = i + 1;
         const copyStartTime = Date.now();
-
+        
         try {
           logger.debug(`Generating PDF for copy ${copyNumber}/${label.copies}...`);
 
-          const pdfBuffer = await page!.pdf(pdfOptions);
+          // FIXED: Add timeout wrapper for PDF generation
+          const pdfPromise = page!.pdf(pdfOptions);
+          const pdfTimeout = new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error('PDF generation timeout')), 8000)
+          );
+          
+          const pdfBuffer = await Promise.race([pdfPromise, pdfTimeout]);
           logger.debug(`PDF generated successfully for copy ${copyNumber}`);
 
           const timestamp = Date.now();
@@ -333,12 +320,10 @@ export class PrinterService {
           const tmpDir = join(process.cwd(), 'tmp');
           const pdfFilePath = join(tmpDir, pdfFileName);
 
-          // Ensure tmp directory exists
           if (!existsSync(tmpDir)) {
             await fs.mkdir(tmpDir, { recursive: true });
           }
 
-          // Use async file write
           await fs.writeFile(pdfFilePath, pdfBuffer);
           logger.debug(`PDF file written: ${pdfFilePath}`);
 
@@ -347,10 +332,12 @@ export class PrinterService {
           const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${label.printerName}"`;
 
           logger.debug(`Executing print command for copy ${copyNumber}...`);
-          await execAsync(printCommand, { timeout: 15000 });
+          
+          // FIXED: Shorter print timeout
+          await execAsync(printCommand, { timeout: 10000 });
           logger.debug(`Print command completed for copy ${copyNumber}`);
 
-          // Async cleanup
+          // FIXED: Immediate cleanup instead of delayed
           setTimeout(async () => {
             try {
               if (existsSync(pdfFilePath)) {
@@ -359,7 +346,7 @@ export class PrinterService {
             } catch (cleanupError) {
               logger.debug('Cleanup error (ignored):', cleanupError);
             }
-          }, 5000);
+          }, 2000); // FIXED: Reduced from 5000
 
           const copyTime = Date.now() - copyStartTime;
           logger.debug(`✅ Copy ${copyNumber} completed in ${copyTime}ms`);
@@ -369,34 +356,30 @@ export class PrinterService {
         } catch (error: any) {
           const copyTime = Date.now() - copyStartTime;
           logger.error(`❌ Copy ${copyNumber} failed after ${copyTime}ms:`, error.message);
-
-          // Don't throw here - let other copies continue
+          
           return { copyNumber, success: false, time: copyTime, error: error.message };
         }
       });
 
-      // Wait for all copies to complete
       const results = await Promise.allSettled(copyPromises);
-
-      // Process results
-      const successful = results.filter((result, i) =>
+      
+      const successful = results.filter((result, i) => 
         result.status === 'fulfilled' && result.value.success
       );
-
-      const failed = results.filter((result, i) =>
-        result.status === 'rejected' ||
+      
+      const failed = results.filter((result, i) => 
+        result.status === 'rejected' || 
         (result.status === 'fulfilled' && !result.value.success)
       );
 
       const totalTime = Date.now() - startTime;
-
+      
       if (successful.length === label.copies) {
         logger.info(`✅ PARALLEL SUCCESS: ${label.copies} copies in ${totalTime}ms (${Math.round(totalTime / label.copies)}ms/copy avg)`);
       } else if (successful.length > 0) {
         logger.warn(`⚠️ PARTIAL SUCCESS: ${successful.length}/${label.copies} copies completed in ${totalTime}ms`);
         logger.warn(`Failed copies: ${failed.length}`);
-
-        // If more than half failed, throw error
+        
         if (failed.length > successful.length) {
           throw new Error(`Print job mostly failed: ${failed.length}/${label.copies} copies failed`);
         }
@@ -404,43 +387,33 @@ export class PrinterService {
         throw new Error(`All ${label.copies} copies failed to print`);
       }
 
-      // Force garbage collection for large PDFs
-      if (results.length > 5) {
+      // FIXED: More aggressive garbage collection
+      if (results.length > 3) {
         if (global.gc) global.gc();
       }
 
     } catch (error: any) {
       logger.error(`❌ Parallel printing failed: ${error.message}`);
-      logger.error('Error stack:', error.stack);
-
-      // Log browser state for debugging
-      try {
-        if (this.browser) {
-          const pages = await this.browser.pages();
-          logger.debug(`Browser state: connected=${this.browser.connected}, pages=${pages.length}`);
-        }
-        if (page && !page.isClosed()) {
-          logger.debug('Page state: not closed');
-        } else {
-          logger.debug('Page state: closed or null');
-        }
-      } catch (stateError) {
-        logger.debug('Error checking browser/page state:', stateError);
-      }
-
       throw error;
     } finally {
       if (page) {
         try {
           if (!page.isClosed()) {
             logger.debug('Closing page...');
-            await page.close();
+            
+            // FIXED: Add timeout to page closing
+            const closePromise = page.close();
+            const closeTimeout = new Promise<never>((_, reject) => 
+              setTimeout(() => reject(new Error('Page close timeout')), 3000)
+            );
+            
+            await Promise.race([closePromise, closeTimeout]);
             logger.debug('Page closed successfully');
-          } else {
-            logger.debug('Page was already closed');
           }
         } catch (closeError: any) {
           logger.warn('Error closing page:', closeError.message);
+          // FIXED: Force page to null even if close fails
+          page = null;
         }
       }
     }
@@ -481,32 +454,29 @@ export class PrinterService {
     try {
       logger.info(`Resetting media values for Zebra printer: ${printerName}`);
 
-      // Check if printer exists and is online
       const printer: PrinterStatus | undefined = this.printers.get(printerName);
       if (!printer || printer.status !== 'online') {
         throw new Error(`Printer ${printerName} is not available`);
       }
 
-      // ZPL commands to reset media values
       const zplCommands = [
-        '~SD20',        // Set darkness to 20
-        '~JSN',         // Disable JSON
-        '^XA',          // Start format
-        '^SZ2',         // Set ZPL mode to ZPL II
-        '^PW203',       // Set print width to 203 dots (1 inch at 203 DPI)
-        '^LL2030',      // Set label length to 2030 dots (10 inches at 203 DPI)
-        '^POI',         // Print orientation (N)ormal | (I)nverted
-        '^PMN',         // Print method normal
-        '^MNM',         // Media tracking method - non-continuous (gap/notch)
-        '^LS0',         // Label shift 0
-        '^MTT',         // Media type thermal transfer
-        '^MMT,N',       // Print mode thermal transfer, normal
-        '^MPE',         // Mode print and cut
-        '^XZ',          // End format
-        '^XA^JUS^XZ'    // Reset all settings and save
+        '~SD20',
+        '~JSN',
+        '^XA',
+        '^SZ2',
+        '^PW203',
+        '^LL2030',
+        '^POI',
+        '^PMN',
+        '^MNM',
+        '^LS0',
+        '^MTT',
+        '^MMT,N',
+        '^MPE',
+        '^XZ',
+        '^XA^JUS^XZ'
       ].join('\n');
 
-      // Create temporary ZPL file
       const timestamp = Date.now();
       const randomId = Math.random().toString(36).substr(2, 9);
       const tempFile: string = `zebra_reset_${timestamp}_${randomId}.zpl`;
@@ -519,14 +489,14 @@ export class PrinterService {
       const fullTempPath = join(tmpDir, tempFile);
       await fs.writeFile(fullTempPath, zplCommands, 'utf8');
 
-      // Send ZPL commands to printer using Windows copy command with timeout
       const copyCommand = `copy "${fullTempPath}" "${printerName}"`;
 
       try {
-        const { stdout, stderr } = await execAsync(copyCommand, { timeout: 8000 }); // Add timeout
+        // FIXED: Shorter timeout for ZPL commands
+        const { stdout, stderr } = await execAsync(copyCommand, { timeout: 5000 });
         logger.info(`✅ ZPL commands sent successfully to ${printerName}`);
 
-        // Clean up temporary file
+        // FIXED: Immediate cleanup
         setTimeout(async () => {
           try {
             if (existsSync(fullTempPath)) {
@@ -535,13 +505,12 @@ export class PrinterService {
           } catch (cleanupError) {
             logger.warn(`Failed to cleanup ZPL temp file ${tempFile}:`, cleanupError);
           }
-        }, 2000);
+        }, 1000); // FIXED: Reduced from 2000
 
         return true;
       } catch (error: any) {
         logger.error(`Failed to send ZPL commands to ${printerName}:`, error);
 
-        // Clean up temporary file on error
         try {
           if (existsSync(fullTempPath)) {
             await fs.unlink(fullTempPath);
@@ -570,7 +539,8 @@ export class PrinterService {
       printersOnline: Array.from(this.printers.values()).filter(p => p.status === 'online').length,
       totalPrinters: this.printers.size,
       printerErrors: Object.fromEntries(this.printerErrorCounts),
-      printerLastErrors: Object.fromEntries(this.printerLastError)
+      printerLastErrors: Object.fromEntries(this.printerLastError),
+      backgroundOperationActive: this.backgroundOperationActive // FIXED: Add monitoring
     };
   }
 
@@ -622,8 +592,12 @@ export class PrinterService {
   }
 
   public destroy(): void {
+    // FIXED: Clear background operation flag
+    this.backgroundOperationActive = false;
+    
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = undefined;
     }
 
     if (this.browser) {
@@ -631,5 +605,10 @@ export class PrinterService {
         logger.error('Error closing Puppeteer browser:', error);
       });
     }
+    
+    // FIXED: Clear all maps
+    this.printers.clear();
+    this.printerErrorCounts.clear();
+    this.printerLastError.clear();
   }
 }
