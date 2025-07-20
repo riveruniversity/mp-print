@@ -53,6 +53,8 @@ export interface PrinterStatus {
   name: string;
   port: string;
   driver: string;
+  description?: string;
+  location?: string;
   status: PrinterStatusType;
   jobsInQueue: number;
   lastJobTime?: number;
@@ -131,6 +133,8 @@ export interface WindowsPrinter {
   Name: string;
   DriverName: string;
   PortName: string;
+  Description: string;
+  Location: string;
 }
 
 export interface ApiResponse<T = any> {

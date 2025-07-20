@@ -9,6 +9,7 @@ import logger from './utils/logger';
 import printRoutes, { initializePrintService } from './routes/print';
 import { HealthCheckResponse } from './types';
 import { corsConfig } from './middleware/cors';
+import { globalTimeoutMiddleware, printRouteTimeout } from './middleware/timeout'; // ADD THIS
 
 if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
   const numWorkers: number = config.server.workers;
@@ -37,6 +38,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
 
   // CORS middleware
   app.use(corsConfig);
+
+  // ADD GLOBAL TIMEOUT MIDDLEWARE HERE - EARLY IN THE STACK
+  app.use(globalTimeoutMiddleware(30000)); // 30 second global timeout
 
   // Rate limiting
   const limiter = rateLimit({
@@ -69,6 +73,9 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production') {
     logger.info(`${req.method} ${req.path} - ${req.ip}`);
     next();
   });
+
+  // ADD PRINT-SPECIFIC TIMEOUT MIDDLEWARE FOR PRINT ROUTES
+  app.use('/api/print', printRouteTimeout(15000)); // 15 second timeout for print routes
 
   // Routes
   app.use('/api/print', printRoutes);

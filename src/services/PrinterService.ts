@@ -1,8 +1,9 @@
-// Enhanced PrinterService.ts with optimized Puppeteer usage
+// Enhanced PrinterService.ts with async processing and error isolation
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { writeFileSync, unlinkSync, existsSync } from 'fs';
+import { promises as fs } from 'fs';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { Browser, Page } from 'puppeteer';
 import { PrinterStatus, PrinterStatusType, PrintLabel, PrintMetadata, WindowsPrinter } from '../types';
@@ -20,6 +21,10 @@ export class PrinterService {
   private printers: Map<string, PrinterStatus> = new Map();
   private healthCheckInterval?: ReturnType<typeof setInterval>;
 
+  // Track printer-specific errors to isolate issues
+  private printerErrorCounts: Map<string, number> = new Map();
+  private printerLastError: Map<string, number> = new Map();
+
   public async initialize(): Promise<void> {
     await this.browserService.initialize();
     this.browser = this.browserService.browser;
@@ -28,12 +33,12 @@ export class PrinterService {
     this.startHealthCheck();
   }
 
-
   private async discoverPrinters(): Promise<void> {
     try {
       const command: string = `powershell -Command "Get-Printer | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
 
-      const { stdout }: { stdout: string; } = await execAsync(command);
+      // Add timeout to prevent hanging
+      const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 5000 });
 
       if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
         logger.warn('No printers discovered');
@@ -52,6 +57,10 @@ export class PrinterService {
           jobsInQueue: 0,
           errorCount: 0
         });
+        
+        // Initialize error tracking
+        this.printerErrorCounts.set(printer.Name, 0);
+        this.printerLastError.set(printer.Name, 0);
       }
 
       console.log('🖨️  printers', printerArray.map(p => p.Name));
@@ -78,29 +87,47 @@ export class PrinterService {
   }
 
   private async checkPrinterHealth(): Promise<void> {
-    for (const [printerName, status] of this.printers) {
+    // Process all printer health checks in parallel with timeouts
+    const healthCheckPromises = Array.from(this.printers.entries()).map(async ([printerName, status]) => {
       try {
         const command: string = `powershell -Command "Get-Printer -Name '${printerName}' | Select-Object PrinterStatus, Name, DriverName, PortName | ConvertTo-Json -Compress"`;
-        const { stdout }: { stdout: string; } = await execAsync(command);
+        
+        // Add timeout to prevent hanging on individual printer checks
+        const { stdout }: { stdout: string; } = await execAsync(command, { timeout: 3000 });
 
         if (!stdout || stdout.trim() === '' || stdout.trim() === 'null') {
           logger.warn(`No printer data returned for ${printerName}`);
           status.status = 'offline';
           status.errorCount++;
-          continue;
+          return;
         }
+        
         const result: { PrinterStatus: number, Name: string, DriverName: string, PortName: string; } = JSON.parse(stdout);
         const newStatus: PrinterStatusType = this.mapPrinterStatus(result.PrinterStatus);
+        
         if (newStatus !== status.status) {
           logger.info(`Printer ${printerName} status changed from ${status.status} to ${newStatus}`);
           status.status = newStatus;
+          
+          // Reset error count if printer comes back online
+          if (newStatus === 'online') {
+            this.printerErrorCounts.set(printerName, 0);
+          }
         }
       } catch (error: any) {
         logger.warn(`Health check failed for printer ${printerName}:`, error);
         status.status = 'error';
         status.errorCount++;
+        
+        // Track printer-specific errors
+        const currentErrors = this.printerErrorCounts.get(printerName) || 0;
+        this.printerErrorCounts.set(printerName, currentErrors + 1);
+        this.printerLastError.set(printerName, Date.now());
       }
-    }
+    });
+
+    // Wait for all health checks to complete, but don't let one failure block others
+    await Promise.allSettled(healthCheckPromises);
   }
 
   public getPrinterStatus(printerName: string): PrinterStatus | undefined {
@@ -108,12 +135,34 @@ export class PrinterService {
   }
 
   public getAllPrinters(): PrinterStatus[] {
-    return Array.from(this.printers.values());
+    try {
+      // Add timeout protection for Map access
+      const printersArray = Array.from(this.printers.values());
+      return printersArray;
+    } catch (error) {
+      logger.error('Error accessing printers Map:', error);
+      return []; // Return empty array if there's an issue
+    }
   }
 
   public isOnline(printerName: string): boolean {
     const printer: PrinterStatus | undefined = this.printers.get(printerName);
-    return printer?.status === 'online';
+    if (!printer || printer.status !== 'online') {
+      return false;
+    }
+    
+    // Check if printer has had too many recent errors
+    const errorCount = this.printerErrorCounts.get(printerName) || 0;
+    const lastError = this.printerLastError.get(printerName) || 0;
+    const timeSinceLastError = Date.now() - lastError;
+    
+    // If printer has had more than 3 errors in the last 5 minutes, consider it unstable
+    if (errorCount > 3 && timeSinceLastError < 300000) {
+      logger.warn(`Printer ${printerName} considered unstable due to recent errors`);
+      return false;
+    }
+    
+    return true;
   }
 
   public updateJobCount(printerName: string, delta: number): void {
@@ -124,13 +173,15 @@ export class PrinterService {
     }
   }
 
-
-
-
   public async printLabel(label: PrintLabel, metadata: PrintMetadata): Promise<void> {
     const printer: PrinterStatus | undefined = this.printers.get(label.printerName);
     if (!printer || printer.status !== 'online') {
       throw new Error(`Printer ${label.printerName} is not available`);
+    }
+
+    // Check if printer is stable
+    if (!this.isOnline(label.printerName)) {
+      throw new Error(`Printer ${label.printerName} is unstable or has recent errors`);
     }
 
     try {
@@ -139,49 +190,42 @@ export class PrinterService {
 
       const totalStartTime = Date.now();
 
-      if (this.browser) {
-        try {
-          await this.printWithPuppeteer(enhancedHtml, label, metadata);
-        } catch (error) {
-          logger.warn(`❌ PUPPETEER FAILED: ${error}, falling back to wkhtmltopdf`);
-          if (this.browserService.wkhtmltopdfPath) {
-            await this.printWithWkhtmltopdf(enhancedHtml, label, metadata);
-          } else {
-            throw new Error('Both Puppeteer and wkhtmltopdf are unavailable');
-          }
+      // Only use Puppeteer - no fallback needed
+      if (!this.browser || !this.browser.connected) {
+        await this.browserService.reinitializeBrowser();
+        this.browser = this.browserService.browser;
+        if (!this.browser || !this.browser.connected) {
+          throw new Error('Browser not available');
         }
-      } else if (this.browserService.wkhtmltopdfPath) {
-        await this.printWithWkhtmltopdf(enhancedHtml, label, metadata);
-      } else {
-        throw new Error('Neither Puppeteer nor wkhtmltopdf is available');
       }
+
+      await this.printWithPuppeteer(enhancedHtml, label, metadata);
 
       const totalTime = Date.now() - totalStartTime;
       logger.info(`📊 LABEL PRINT: ${label.copies} copies of "${label.name}" completed in ${totalTime}ms`);
 
+      // Reset error count on successful print
+      this.printerErrorCounts.set(label.printerName, 0);
+
     } catch (error: any) {
+      // Track printer-specific error
+      const currentErrors = this.printerErrorCounts.get(label.printerName) || 0;
+      this.printerErrorCounts.set(label.printerName, currentErrors + 1);
+      this.printerLastError.set(label.printerName, Date.now());
+      
       logger.error(`Print failed for label "${label.name}" on printer ${label.printerName}:`, error);
       throw error;
     }
   }
 
-
   private async printWithPuppeteer(html: string, label: PrintLabel, metadata: PrintMetadata): Promise<void> {
-    if (!this.browser || !this.browser.connected) {
-      await this.browserService.reinitializeBrowser();
-      this.browser = this.browserService.browser;
-      if (!this.browser || !this.browser.connected) {
-        throw new Error('Browser not available');
-      }
-    }
-
-    logger.info(`=== ULTRA-CONSERVATIVE PUPPETEER ===`);
+    logger.info(`=== PUPPETEER PARALLEL PROCESSING ===`);
     const startTime = Date.now();
 
     let page: Page | null = null;
 
     try {
-      page = await this.browser.newPage();
+      page = await this.browser!.newPage();
 
       await page.setViewport({
         width: 800,
@@ -196,7 +240,6 @@ export class PrinterService {
       });
       logger.debug('Page content set successfully');
 
-      // Use label dimensions instead of hardcoded values
       const pdfOptions = {
         format: undefined,
         printBackground: true,
@@ -212,61 +255,105 @@ export class PrinterService {
         timeout: 10000
       };
 
-      logger.debug('Starting PDF generation...');
+      logger.debug('Starting parallel PDF generation...');
 
-      // Generate each copy separately
-      for (let i = 0; i < label.copies; i++) {
-        logger.debug(`Generating PDF for copy ${i + 1}/${label.copies}...`);
+      // Create all copy processing promises in parallel
+      const copyPromises = Array.from({ length: label.copies }, async (_, i) => {
+        const copyNumber = i + 1;
+        const copyStartTime = Date.now();
+        
+        try {
+          logger.debug(`Generating PDF for copy ${copyNumber}/${label.copies}...`);
 
-        const pdfBuffer = await page.pdf(pdfOptions);
-        logger.debug(`PDF generated successfully for copy ${i + 1}`);
+          const pdfBuffer = await page!.pdf(pdfOptions);
+          logger.debug(`PDF generated successfully for copy ${copyNumber}`);
 
-        const timestamp = Date.now();
-        const pdfFileName = `conservative_${timestamp}_${i + 1}.pdf`;
-        const tmpDir = join(process.cwd(), 'tmp');
-        const pdfFilePath = join(tmpDir, pdfFileName);
+          const timestamp = Date.now();
+          const pdfFileName = `parallel_${timestamp}_${copyNumber}.pdf`;
+          const tmpDir = join(process.cwd(), 'tmp');
+          const pdfFilePath = join(tmpDir, pdfFileName);
 
-        if (!existsSync(tmpDir)) {
-          require('fs').mkdirSync(tmpDir, { recursive: true });
-        }
-
-        writeFileSync(pdfFilePath, pdfBuffer);
-        logger.debug(`PDF file written: ${pdfFilePath}`);
-
-        const binDir = join(process.cwd(), 'bin');
-        const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
-        const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${label.printerName}"`;
-
-        logger.debug(`Executing print command for copy ${i + 1}...`);
-        await execAsync(printCommand, { timeout: 15000 });
-        logger.debug(`Print command completed for copy ${i + 1}`);
-
-        if (pdfBuffer.length > 1024 * 1024) {
-          if (global.gc) global.gc();
-        }
-
-        setTimeout(() => {
-          try {
-            if (existsSync(pdfFilePath)) {
-              unlinkSync(pdfFilePath);
-            }
-          } catch (cleanupError) {
-            logger.debug('Cleanup error (ignored):', cleanupError);
+          // Ensure tmp directory exists
+          if (!existsSync(tmpDir)) {
+            await fs.mkdir(tmpDir, { recursive: true });
           }
-        }, 5000);
 
-        if (i < label.copies - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+          // Use async file write
+          await fs.writeFile(pdfFilePath, pdfBuffer);
+          logger.debug(`PDF file written: ${pdfFilePath}`);
+
+          const binDir = join(process.cwd(), 'bin');
+          const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
+          const printCommand = `"${pdfToPrinterPath}" "${pdfFilePath}" "${label.printerName}"`;
+
+          logger.debug(`Executing print command for copy ${copyNumber}...`);
+          await execAsync(printCommand, { timeout: 15000 });
+          logger.debug(`Print command completed for copy ${copyNumber}`);
+
+          // Async cleanup
+          setTimeout(async () => {
+            try {
+              if (existsSync(pdfFilePath)) {
+                await fs.unlink(pdfFilePath);
+              }
+            } catch (cleanupError) {
+              logger.debug('Cleanup error (ignored):', cleanupError);
+            }
+          }, 5000);
+
+          const copyTime = Date.now() - copyStartTime;
+          logger.debug(`✅ Copy ${copyNumber} completed in ${copyTime}ms`);
+
+          return { copyNumber, success: true, time: copyTime };
+
+        } catch (error: any) {
+          const copyTime = Date.now() - copyStartTime;
+          logger.error(`❌ Copy ${copyNumber} failed after ${copyTime}ms:`, error.message);
+          
+          // Don't throw here - let other copies continue
+          return { copyNumber, success: false, time: copyTime, error: error.message };
         }
-      }
+      });
+
+      // Wait for all copies to complete
+      const results = await Promise.allSettled(copyPromises);
+      
+      // Process results
+      const successful = results.filter((result, i) => 
+        result.status === 'fulfilled' && result.value.success
+      );
+      
+      const failed = results.filter((result, i) => 
+        result.status === 'rejected' || 
+        (result.status === 'fulfilled' && !result.value.success)
+      );
 
       const totalTime = Date.now() - startTime;
-      logger.info(`✅ ULTRA-CONSERVATIVE: ${label.copies} copies in ${totalTime}ms (${Math.round(totalTime / label.copies)}ms/copy)`);
+      
+      if (successful.length === label.copies) {
+        logger.info(`✅ PARALLEL SUCCESS: ${label.copies} copies in ${totalTime}ms (${Math.round(totalTime / label.copies)}ms/copy avg)`);
+      } else if (successful.length > 0) {
+        logger.warn(`⚠️ PARTIAL SUCCESS: ${successful.length}/${label.copies} copies completed in ${totalTime}ms`);
+        logger.warn(`Failed copies: ${failed.length}`);
+        
+        // If more than half failed, throw error
+        if (failed.length > successful.length) {
+          throw new Error(`Print job mostly failed: ${failed.length}/${label.copies} copies failed`);
+        }
+      } else {
+        throw new Error(`All ${label.copies} copies failed to print`);
+      }
+
+      // Force garbage collection for large PDFs
+      if (results.length > 5) {
+        if (global.gc) global.gc();
+      }
 
     } catch (error: any) {
-      logger.error(`❌ Ultra-conservative method failed: ${error.message}`);
+      logger.error(`❌ Parallel printing failed: ${error.message}`);
       logger.error('Error stack:', error.stack);
 
+      // Log browser state for debugging
       try {
         if (this.browser) {
           const pages = await this.browser.pages();
@@ -296,96 +383,6 @@ export class PrinterService {
           logger.warn('Error closing page:', closeError.message);
         }
       }
-    }
-  }
-
-
-
-  private async printWithWkhtmltopdf(html: string, label: PrintLabel, metadata: PrintMetadata): Promise<void> {
-    const startTime = Date.now();
-
-    logger.info(`=== WKHTMLTOPDF FALLBACK METHOD ===`);
-
-    try {
-      for (let i: number = 0; i < label.copies; i++) {
-        await this.printSingleCopyWithWkhtmltopdf(html, label, i + 1, metadata);
-      }
-
-      const wkhtmltopdfTime = Date.now() - startTime;
-      logger.info(`✅ WKHTMLTOPDF FALLBACK: ${label.copies} copies printed in ${wkhtmltopdfTime}ms (avg: ${Math.round(wkhtmltopdfTime / label.copies)}ms per copy)`);
-
-    } catch (error: any) {
-      logger.error(`❌ wkhtmltopdf fallback failed: ${error.message}`);
-      throw error;
-    }
-  }
-
-  private async printSingleCopyWithWkhtmltopdf(html: string, label: PrintLabel, copyNumber: number, metadata: PrintMetadata): Promise<void> {
-    const startTime = Date.now();
-
-    try {
-      const timestamp = Date.now();
-      const randomId = Math.random().toString(36).substr(2, 9);
-      const tempFile: string = `temp_${timestamp}_${randomId}.html`;
-      const tmpDir = join(process.cwd(), 'tmp');
-      if (!existsSync(tmpDir)) {
-        require('fs').mkdirSync(tmpDir, { recursive: true });
-      }
-      const htmlFilePath = join(tmpDir, tempFile);
-      const pdfFile = htmlFilePath.replace('.html', '.pdf');
-
-      writeFileSync(htmlFilePath, html, 'utf8');
-
-      // Build wkhtmltopdf command with label dimensions
-      const args = [
-        `--margin-top ${label.margin.top}`,
-        `--margin-bottom ${label.margin.bottom}`,
-        `--margin-left ${label.margin.left}`,
-        `--margin-right ${label.margin.right}`,
-        '--enable-local-file-access',
-        `--page-width ${label.width}`,
-        `--page-height ${label.height}`
-      ];
-
-      if (label.orientation) {
-        args.push('--orientation ' + label.orientation);
-      }
-
-      args.push(`"${htmlFilePath}"`, `"${pdfFile}"`);
-
-      const convertCommand = `"${this.browserService.wkhtmltopdfPath}" ${args.join(' ')}`;
-      await execAsync(convertCommand, { timeout: 5000 });
-
-      const binDir = join(process.cwd(), 'bin');
-      const pdfToPrinterPath = join(binDir, 'PDFtoPrinter.exe');
-      const printCommand = `"${pdfToPrinterPath}" "${pdfFile}" "${label.printerName}"`;
-
-      await execAsync(printCommand, { timeout: 5000 });
-
-      setTimeout(() => {
-        try {
-          if (existsSync(htmlFilePath)) {
-            unlinkSync(htmlFilePath);
-          }
-          if (existsSync(pdfFile)) {
-            unlinkSync(pdfFile);
-          }
-        } catch (cleanupError) {
-          logger.warn(`Failed to cleanup temp files:`, cleanupError);
-        }
-      }, 2000);
-
-      const duration = Date.now() - startTime;
-      logger.debug(`⚡ wkhtmltopdf copy ${copyNumber}/${label.copies}: ${duration}ms`);
-
-      if (copyNumber < label.copies) {
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-
-    } catch (error: any) {
-      const duration = Date.now() - startTime;
-      logger.error(`❌ wkhtmltopdf copy ${copyNumber} failed after ${duration}ms: ${error.message}`);
-      throw error;
     }
   }
 
@@ -430,7 +427,7 @@ export class PrinterService {
         throw new Error(`Printer ${printerName} is not available`);
       }
 
-      // ZPL commands to reset media values for ZTC ZD620-203dpi
+      // ZPL commands to reset media values
       const zplCommands = [
         '~SD20',        // Set darkness to 20
         '~JSN',         // Disable JSON
@@ -456,24 +453,24 @@ export class PrinterService {
       const tmpDir = join(process.cwd(), 'tmp');
 
       if (!existsSync(tmpDir)) {
-        require('fs').mkdirSync(tmpDir, { recursive: true });
+        await fs.mkdir(tmpDir, { recursive: true });
       }
 
       const fullTempPath = join(tmpDir, tempFile);
-      writeFileSync(fullTempPath, zplCommands, 'utf8');
+      await fs.writeFile(fullTempPath, zplCommands, 'utf8');
 
-      // Send ZPL commands to printer using Windows copy command
+      // Send ZPL commands to printer using Windows copy command with timeout
       const copyCommand = `copy "${fullTempPath}" "${printerName}"`;
 
       try {
-        const { stdout, stderr } = await execAsync(copyCommand, { timeout: 10000 });
+        const { stdout, stderr } = await execAsync(copyCommand, { timeout: 8000 }); // Add timeout
         logger.info(`✅ ZPL commands sent successfully to ${printerName}`);
 
         // Clean up temporary file
-        setTimeout(() => {
+        setTimeout(async () => {
           try {
             if (existsSync(fullTempPath)) {
-              unlinkSync(fullTempPath);
+              await fs.unlink(fullTempPath);
             }
           } catch (cleanupError) {
             logger.warn(`Failed to cleanup ZPL temp file ${tempFile}:`, cleanupError);
@@ -487,7 +484,7 @@ export class PrinterService {
         // Clean up temporary file on error
         try {
           if (existsSync(fullTempPath)) {
-            unlinkSync(fullTempPath);
+            await fs.unlink(fullTempPath);
           }
         } catch (cleanupError) {
           logger.warn(`Failed to cleanup ZPL temp file ${tempFile}:`, cleanupError);
@@ -502,21 +499,20 @@ export class PrinterService {
     }
   }
 
-
   public getBrowserStatus() {
     return this.browserService.getPerformanceStats();
   }
-
 
   public getPerformanceStats(): any {
     return {
       ...this.getBrowserStatus(),
       memoryUsage: process.memoryUsage(),
       printersOnline: Array.from(this.printers.values()).filter(p => p.status === 'online').length,
-      totalPrinters: this.printers.size
+      totalPrinters: this.printers.size,
+      printerErrors: Object.fromEntries(this.printerErrorCounts),
+      printerLastErrors: Object.fromEntries(this.printerLastError)
     };
   }
-
 
   public async testPrint(printerName: string): Promise<boolean> {
     try {
@@ -564,8 +560,6 @@ export class PrinterService {
       return false;
     }
   }
-
-
 
   public destroy(): void {
     if (this.healthCheckInterval) {

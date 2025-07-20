@@ -1,30 +1,17 @@
 import puppeteer, { Browser, Page } from 'puppeteer';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { existsSync } from 'fs';
 import logger from '../utils/logger';
-
-
-
-const execAsync = promisify(exec);
 
 export class BrowserService {
 
   public browser?: Browser;
-  public wkhtmltopdfPath?: string;
   private chromePath: string | undefined;
-
   private browserHealthInterval?: ReturnType<typeof setInterval>;
 
-
-
   public async initialize(): Promise<void> {
-    await this.findWkhtmltopdf();
     await this.initializePuppeteer();
-
     this.startBrowserHealthCheck();
   }
-
 
   // Puppeteer implementation 
   private async initializePuppeteer(): Promise<void> {
@@ -33,7 +20,6 @@ export class BrowserService {
         'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
       ];
-
 
       for (const path of chromePaths) {
         if (require('fs').existsSync(path)) {
@@ -91,36 +77,6 @@ export class BrowserService {
     }
   }
 
-
-  private async findWkhtmltopdf(): Promise<void> {
-    const possiblePaths = [
-      'C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe',
-      'C:\\Program Files (x86)\\wkhtmltopdf\\bin\\wkhtmltopdf.exe',
-      'wkhtmltopdf.exe' // System PATH
-    ];
-
-    for (const path of possiblePaths) {
-      try {
-        if (path === 'wkhtmltopdf.exe') {
-          // Test if it's in PATH
-          await execAsync('where wkhtmltopdf.exe');
-          this.wkhtmltopdfPath = path;
-          logger.info('Found wkhtmltopdf in system PATH - available as fallback');
-          return;
-        } else if (existsSync(path)) {
-          this.wkhtmltopdfPath = path;
-          logger.info(`Found wkhtmltopdf at: ${path} - available as fallback`);
-          return;
-        }
-      } catch (error) {
-        // Continue to next path
-      }
-    }
-
-    logger.warn('wkhtmltopdf not found - Puppeteer will be the only available method');
-  }
-
-
   // browser health check
   private startBrowserHealthCheck(): void {
     this.browserHealthInterval = setInterval(async () => {
@@ -131,10 +87,9 @@ export class BrowserService {
     }, 60000);
   }
 
-
   // Conservative browser reinitialization
   public async reinitializeBrowser(): Promise<void> {
-    logger.info('🔄 Reinitializing browser (ultra-conservative mode)...');
+    logger.info('🔄 Reinitializing browser...');
 
     try {
       // Close old browser with timeout
@@ -158,14 +113,13 @@ export class BrowserService {
       // Reinitialize browser
       await this.initializePuppeteer();
 
-      logger.info('✅ Browser reinitialized successfully (ultra-conservative mode)');
+      logger.info('✅ Browser reinitialized successfully');
     } catch (error: any) {
-      logger.error('❌ Failed to reinitialize browser (ultra-conservative mode):', error);
+      logger.error('❌ Failed to reinitialize browser:', error);
       throw error;
     }
   }
 
-  // 5. Updated getBrowserStatus
   public getBrowserStatus(): { available: boolean, error?: string, stats?: any; } {
     try {
       if (!this.browser) {
@@ -179,8 +133,7 @@ export class BrowserService {
       return {
         available: true,
         stats: {
-          mode: 'ultra-conservative',
-          pagePoolEnabled: false,
+          mode: 'parallel-processing',
           browserConnected: this.browser.connected
         }
       };
@@ -189,7 +142,6 @@ export class BrowserService {
     }
   }
 
-
   public getPerformanceStats(): any {
     return {
       browserConnected: this.browser?.connected || false,
@@ -197,9 +149,7 @@ export class BrowserService {
     };
   }
 
-
   public destroy(): void {
-
     if (this.browserHealthInterval) {
       clearInterval(this.browserHealthInterval);
     }
@@ -210,5 +160,4 @@ export class BrowserService {
       });
     }
   }
-
 }

@@ -1,4 +1,4 @@
-// src/services/PrintService.ts - Enhanced Singleton with Ultra-Optimization Support
+// src/services/PrintService.ts - Enhanced Singleton with improved error isolation
 
 import { PrinterService } from './PrinterService';
 import { QueueService } from './QueueService';
@@ -23,13 +23,12 @@ export class PrintService {
     activePrinters: 0
   };
 
-  // Ultra-optimization tracking
-  private ultraOptimizationMetrics = {
-    totalUltraOptimizedJobs: 0,
-    averageUltraOptimizedTime: 0,
-    puppeteerFallbackCount: 0,
-    wkhtmltopdfFallbackCount: 0,
-    lastOptimizationCheck: Date.now()
+  // Performance tracking
+  private performanceMetrics = {
+    totalProcessedJobs: 0,
+    averageJobTime: 0,
+    parallelJobsCount: 0,
+    lastPerformanceCheck: Date.now()
   };
 
   private constructor() {
@@ -52,13 +51,13 @@ export class PrintService {
     }
 
     try {
-      logger.info('Initializing PrintService singleton with ultra-optimization...');
+      logger.info('Initializing PrintService singleton...');
       await this.printerService.initialize();
       this.startProcessing();
       this.startMetricsCollection();
 
       PrintService.isInitialized = true;
-      logger.info('✅ PrintService singleton initialized successfully with ultra-optimization support');
+      logger.info('✅ PrintService singleton initialized successfully');
     } catch (error) {
       logger.error('❌ Failed to initialize PrintService singleton:', error);
       throw error;
@@ -96,10 +95,21 @@ export class PrintService {
       Math.min(availableSlots, config.printing.batchSize)
     );
 
+    // Process jobs in parallel with proper error isolation
     const processingPromises: Promise<void>[] = jobs.map((job: PrintJob): Promise<void> =>
-      this.processJob(job)
+      this.processJobWithErrorIsolation(job)
     );
     await Promise.allSettled(processingPromises);
+  }
+
+  private async processJobWithErrorIsolation(job: PrintJob): Promise<void> {
+    try {
+      await this.processJob(job);
+    } catch (error: any) {
+      // Ensure one job failure doesn't affect others
+      logger.error(`Job ${job.id} failed with isolated error:`, error);
+      this.queueService.completeJob(job.id, false, error.message);
+    }
   }
 
   private async processJob(job: PrintJob): Promise<void> {
@@ -123,22 +133,16 @@ export class PrintService {
       const processingTime: number = Date.now() - startTime;
 
       this.updateProcessingTime(processingTime);
-      this.updateUltraOptimizationMetrics(processingTime, label.copies);
+      this.updatePerformanceMetrics(processingTime, label.copies);
 
       const avgTimePerCopy = processingTime / label.copies;
-      if (avgTimePerCopy < 100) {
-        logger.info(`⚡ ULTRA-FAST: ${label.copies} copies of "${label.name}" (userId: ${label.userId}) in ${processingTime}ms (${avgTimePerCopy.toFixed(0)}ms/copy)`);
+      if (avgTimePerCopy < 200) {
+        logger.info(`⚡ FAST PROCESSING: ${label.copies} copies of "${label.name}" (userId: ${label.userId}) in ${processingTime}ms (${avgTimePerCopy.toFixed(0)}ms/copy)`);
       }
 
     } catch (error: any) {
       logger.error(`Job ${job.id} failed:`, error);
       this.queueService.completeJob(job.id, false, error.message);
-
-      if (error.message?.includes('PUPPETEER FAILED')) {
-        this.ultraOptimizationMetrics.puppeteerFallbackCount++;
-      } else if (error.message?.includes('wkhtmltopdf')) {
-        this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount++;
-      }
     } finally {
       const label = request.labels[0];
       this.printerService.updateJobCount(label.printerName, -1);
@@ -157,20 +161,24 @@ export class PrintService {
     }
   }
 
-  private updateUltraOptimizationMetrics(processingTime: number, copies: number): void {
-    this.ultraOptimizationMetrics.totalUltraOptimizedJobs++;
+  private updatePerformanceMetrics(processingTime: number, copies: number): void {
+    this.performanceMetrics.totalProcessedJobs++;
 
-    const currentAvg = this.ultraOptimizationMetrics.averageUltraOptimizedTime;
-    const currentCount = this.ultraOptimizationMetrics.totalUltraOptimizedJobs;
+    const currentAvg = this.performanceMetrics.averageJobTime;
+    const currentCount = this.performanceMetrics.totalProcessedJobs;
 
     if (currentCount === 1) {
-      this.ultraOptimizationMetrics.averageUltraOptimizedTime = processingTime;
+      this.performanceMetrics.averageJobTime = processingTime;
     } else {
-      this.ultraOptimizationMetrics.averageUltraOptimizedTime =
+      this.performanceMetrics.averageJobTime =
         (currentAvg * (currentCount - 1) + processingTime) / currentCount;
     }
 
-    this.ultraOptimizationMetrics.lastOptimizationCheck = Date.now();
+    if (copies > 1) {
+      this.performanceMetrics.parallelJobsCount++;
+    }
+
+    this.performanceMetrics.lastPerformanceCheck = Date.now();
   }
 
   private updateMetrics(): void {
@@ -188,7 +196,7 @@ export class PrintService {
   public submitPrintJob(request: PrintRequest): string {
     this.metrics.totalJobs++;
 
-    // Log submission with ultra-optimization context
+    // Log submission
     const copies = request.metadata.copies || 1;
     logger.debug(`📋 Job submitted: ${copies} copies to ${request.id} (Priority: ${request.metadata.priority})`);
 
@@ -207,7 +215,6 @@ export class PrintService {
     return this.printerService.getAllPrinters();
   }
 
-
   public getBrowserStatus(): { available: boolean, error?: string, stats?: any; } {
     if (typeof this.printerService.getBrowserStatus === 'function') {
       return this.printerService.getBrowserStatus();
@@ -222,12 +229,12 @@ export class PrintService {
       // Browser and Puppeteer stats
       browser: browserStatus,
 
-      // Ultra-optimization metrics
-      ultraOptimization: {
-        ...this.ultraOptimizationMetrics,
-        averageTimePerJob: this.ultraOptimizationMetrics.averageUltraOptimizedTime,
-        optimizationSuccessRate: this.ultraOptimizationMetrics.totalUltraOptimizedJobs > 0
-          ? ((this.ultraOptimizationMetrics.totalUltraOptimizedJobs - this.ultraOptimizationMetrics.puppeteerFallbackCount - this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount) / this.ultraOptimizationMetrics.totalUltraOptimizedJobs * 100).toFixed(1) + '%'
+      // Performance metrics
+      performance: {
+        ...this.performanceMetrics,
+        averageTimePerJob: this.performanceMetrics.averageJobTime,
+        parallelProcessingRate: this.performanceMetrics.totalProcessedJobs > 0
+          ? ((this.performanceMetrics.parallelJobsCount / this.performanceMetrics.totalProcessedJobs) * 100).toFixed(1) + '%'
           : '0%'
       },
 
@@ -251,28 +258,25 @@ export class PrintService {
     };
   }
 
-  public getUltraOptimizationReport(): any {
+  public getPerformanceReport(): any {
     const stats = this.getPerformanceStats();
-    const avgTime = this.ultraOptimizationMetrics.averageUltraOptimizedTime;
+    const avgTime = this.performanceMetrics.averageJobTime;
 
     return {
       status: avgTime < 500 ? 'EXCELLENT' : avgTime < 1000 ? 'GOOD' : avgTime < 2000 ? 'NEEDS_IMPROVEMENT' : 'POOR',
       performance: {
         averageJobTime: avgTime,
-        totalOptimizedJobs: this.ultraOptimizationMetrics.totalUltraOptimizedJobs,
-        successRate: stats.ultraOptimization.optimizationSuccessRate,
-        fallbacks: {
-          puppeteer: this.ultraOptimizationMetrics.puppeteerFallbackCount,
-          wkhtmltopdf: this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount
-        }
+        totalProcessedJobs: this.performanceMetrics.totalProcessedJobs,
+        parallelProcessingRate: stats.performance.parallelProcessingRate,
+        parallelJobsCount: this.performanceMetrics.parallelJobsCount
       },
-      recommendations: this.generateOptimizationRecommendations(avgTime),
+      recommendations: this.generatePerformanceRecommendations(avgTime),
       browserHealth: stats.browser,
-      lastCheck: new Date(this.ultraOptimizationMetrics.lastOptimizationCheck).toISOString()
+      lastCheck: new Date(this.performanceMetrics.lastPerformanceCheck).toISOString()
     };
   }
 
-  private generateOptimizationRecommendations(avgTime: number): string[] {
+  private generatePerformanceRecommendations(avgTime: number): string[] {
     const recommendations: string[] = [];
 
     if (avgTime > 1000) {
@@ -280,21 +284,17 @@ export class PrintService {
       recommendations.push('Check if browser is experiencing memory pressure');
     }
 
-    if (this.ultraOptimizationMetrics.puppeteerFallbackCount > 0) {
-      recommendations.push('Monitor Puppeteer stability - fallbacks detected');
-    }
-
-    if (this.ultraOptimizationMetrics.wkhtmltopdfFallbackCount > 0) {
-      recommendations.push('wkhtmltopdf fallbacks detected - check Puppeteer configuration');
-    }
-
     const browserStatus = this.getBrowserStatus();
     if (!browserStatus.available) {
       recommendations.push('Browser not available - check Puppeteer initialization');
     }
 
+    if (this.performanceMetrics.parallelJobsCount === 0 && this.performanceMetrics.totalProcessedJobs > 10) {
+      recommendations.push('No parallel jobs detected - check if multi-copy labels are being processed');
+    }
+
     if (recommendations.length === 0) {
-      recommendations.push('Ultra-optimization performing excellently!');
+      recommendations.push('Performance is operating optimally!');
     }
 
     return recommendations;
@@ -314,7 +314,7 @@ export class PrintService {
     }
   }
 
-  // Enhanced test method with ultra-optimization awareness
+  // Enhanced test method
   public async testPrint(printerName: string, copies: number = 1): Promise<boolean> {
     if (typeof this.printerService.testPrint === 'function') {
       const startTime = Date.now();
@@ -323,7 +323,7 @@ export class PrintService {
         const result = await this.printerService.testPrint(printerName);
         const duration = Date.now() - startTime;
 
-        logger.info(`🧪 Test print completed in ${duration}ms (Expected: <500ms for ultra-optimization)`);
+        logger.info(`🧪 Test print completed in ${duration}ms (Expected: <500ms for good performance)`);
 
         return result;
       } catch (error) {
